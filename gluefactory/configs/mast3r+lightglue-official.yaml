@@ -1,0 +1,36 @@
+model:
+    name: two_view_pipeline
+    extractor:
+      name: extractors.mast3r
+      sparse_outputs: True
+      dense_outputs: False
+      max_num_keypoints: 2048
+      confidence_threshold: 1.001
+    matcher:
+      name: matchers.lightglue_pretrained
+      features: mast3r
+      depth_confidence: -1
+      width_confidence: -1
+      filter_threshold: 0.1
+benchmarks:
+    megadepth1500:
+      data:
+        preprocessing:
+          side: long
+          resize: 512
+          edge_divisible_by: 16
+      eval:
+        estimator: opencv
+        ransac_th: 0.5
+    hpatches:
+      data:
+        preprocessing:
+          side: long
+          resize: 512
+          edge_divisible_by: 16
+      eval:
+        estimator: opencv
+        ransac_th: 0.5
+      model:
+        extractor:
+          max_num_keypoints: 1024  # overwrite config above

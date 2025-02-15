@@ -69,9 +69,27 @@ class TwoViewPipeline(BaseModel):
             pred_i = {**pred_i, **self.extractor({**data_i, **pred_i})}
         return pred_i
 
+    def extract_two_view(self, data, i, j):
+        data_i = data[f"view{i}"]
+        data_j = data[f"view{j}"]
+        pred_i = data_i.get("cache", {})
+        pred_j = data_i.get("cache", {})
+        skip_extract = (len(pred_i) > 0 and len(pred_j) > 0) and self.conf.allow_no_extract
+        if self.conf.extractor.name and not skip_extract:
+            new_pred_i, new_pred_j = self.extractor((data_i, data_j))
+            pred_i = {**pred_i, **new_pred_i}
+            pred_j = {**pred_j, **new_pred_j}
+        elif self.conf.extractor.name and not self.conf.allow_no_extract:
+            raise NotImplementedError("This behavior is not implemented yet.")
+            # pred_i = {**pred_i, **self.extractor({**data_i, **pred_i})}
+        return pred_i, pred_j
+
     def _forward(self, data):
-        pred0 = self.extract_view(data, "0")
-        pred1 = self.extract_view(data, "1")
+        if self.extractor.conf.siamese_input:
+            pred0, pred1 = self.extract_two_view(data, "0", "1")
+        else:
+            pred0 = self.extract_view(data, "0")
+            pred1 = self.extract_view(data, "1")
         pred = {
             **{k + "0": v for k, v in pred0.items()},
             **{k + "1": v for k, v in pred1.items()},

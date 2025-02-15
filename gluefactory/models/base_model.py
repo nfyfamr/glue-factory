@@ -56,6 +56,7 @@ class BaseModel(nn.Module, metaclass=MetaModel):
         "trainable": True,  # if false: do not optimize this model parameters
         "freeze_batch_normalization": False,  # use test-time statistics
         "timeit": False,  # time forward pass
+        "siamese_input": False,  # if true: the input to forward is a pair of views
     }
     required_data_keys = []
     strict_conf = False
@@ -110,7 +111,10 @@ class BaseModel(nn.Module, metaclass=MetaModel):
                 if isinstance(expected, dict):
                     recursive_key_check(expected[key], given[key])
 
-        recursive_key_check(self.required_data_keys, data)
+        if type(data) == tuple:
+            [recursive_key_check(self.required_data_keys, d) for d in data]
+        else:
+            recursive_key_check(self.required_data_keys, data)
         return self._forward(data)
 
     @abstractmethod
