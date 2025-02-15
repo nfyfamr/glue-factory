@@ -4,6 +4,7 @@ A generic training script that works with any model and dataset.
 Author: Paul-Edouard Sarlin (skydes)
 """
 
+import os
 import io
 import argparse
 import copy
