@@ -4,6 +4,7 @@ A generic training script that works with any model and dataset.
 Author: Paul-Edouard Sarlin (skydes)
 """
 
+import io
 import argparse
 import copy
 import re
@@ -12,6 +13,7 @@ import signal
 from collections import defaultdict
 from pathlib import Path
 from pydoc import locate
+from PIL import Image
 
 import numpy as np
 import torch
@@ -19,6 +21,7 @@ from omegaconf import OmegaConf
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+import wandb
 
 from . import __module_name__, logger
 from .datasets import get_dataset
@@ -228,6 +231,12 @@ def training(rank, conf, output_dir, args):
     set_seed(conf.train.seed)
     if rank == 0:
         writer = SummaryWriter(log_dir=str(output_dir))
+        if os.getenv("WANDB_API_KEY") or os.path.exists(os.path.expanduser("~/.netrc")):
+            wandb_mode = "online"
+        else:
+            print("❌ wandb is not logged in. Wandb logging feature is disabled")
+            wandb_mode = "disabled"
+        wandb.init(project='gluefactory', config={"experiment": args.experiment, "conf": OmegaConf.to_container(conf)}, mode=wandb_mode)
 
     data_conf = copy.deepcopy(conf.data)
     if args.distributed:
@@ -380,6 +389,10 @@ def training(rank, conf, output_dir, args):
                 logger.info(str(s))
                 for metric_name, value in s.items():
                     writer.add_scalar(f"test/{bname}/{metric_name}", value, epoch)
+                    wandb.log({
+                        f"test/{bname}/{metric_name}": value,
+                        "epoch": epoch,
+                    }, commit=False)
                 for fig_name, fig in f.items():
                     writer.add_figure(f"figures/{bname}/{fig_name}", fig, epoch)
 
@@ -494,10 +507,17 @@ def training(rank, conf, output_dir, args):
                         "training/lr", optimizer.param_groups[0]["lr"], tot_n_samples
                     )
                     writer.add_scalar("training/epoch", epoch, tot_n_samples)
+                    wandb.log({
+                        **{f"training/{k}": v for k, v in losses.items()},
+                        "training/lr": optimizer.param_groups[0]["lr"],
+                        "training/epoch": epoch,
+                        "training/tot_n_samples": tot_n_samples,
+                    }, commit=False)
 
             if conf.train.log_grad_every_iter is not None:
                 if it % conf.train.log_grad_every_iter == 0:
                     grad_txt = ""
+                    grad_dict = {}
                     for name, param in model.named_parameters():
                         if param.grad is not None and param.requires_grad:
                             if name.endswith("bias"):
@@ -507,7 +527,9 @@ def training(rank, conf, output_dir, args):
                             )
                             norm = torch.norm(param.grad.detach(), 2)
                             grad_txt += f"{name} {norm.item():.3f}  \n"
+                            grad_dict[f"training/grad/{name}"] = norm.item()
                     writer.add_text("grad/summary", grad_txt, tot_n_samples)
+                    wandb.log({grad_dict}, commit=False)
             del pred, data, loss, losses
 
             # Run validation
@@ -539,10 +561,16 @@ def training(rank, conf, output_dir, args):
                     for k, v in results.items():
                         if isinstance(v, dict):
                             writer.add_scalars(f"figure/val/{k}", v, tot_n_samples)
+                            wandb.log({f"figure/val/{k}": v}, commit=False)
                         else:
                             writer.add_scalar("val/" + k, v, tot_n_samples)
+                            wandb.log({f"val/{k}": v}, commit=False)
                     for k, v in pr_metrics.items():
                         writer.add_pr_curve("val/" + k, *v, tot_n_samples)
+                    # wandb.log({
+                    #     f"val/{k}": wandb.plot.pr_curve(*v) 
+                    #     for k, v in pr_metrics.items()
+                    # }, commit=False)
                     # @TODO: optional always save checkpoint
                     if results[conf.train.best_key] < best_eval:
                         best_eval = results[conf.train.best_key]
@@ -568,6 +596,12 @@ def training(rank, conf, output_dir, args):
                                 writer.add_figure(
                                     f"figures/{i}_{name}", fig, tot_n_samples
                                 )
+                                buf = io.BytesIO()
+                                fig.savefig(buf, format="PNG", bbox_inches='tight')
+                                buf.seek(0)
+                                pil_image = Image.open(buf)
+                                wandb.log({f"figures/{i}_{name}": wandb.Image(pil_image)}, commit=False)
+                                buf.close()
                 torch.cuda.empty_cache()  # should be cleared at the first iter
 
             if (tot_it % conf.train.save_every_iter == 0 and tot_it > 0) and rank == 0:
@@ -596,6 +630,9 @@ def training(rank, conf, output_dir, args):
                     args.distributed,
                 )
 
+            if rank == 0:
+                wandb.log({}, commit=True)
+
             if stop:
                 break
 
@@ -620,6 +657,7 @@ def training(rank, conf, output_dir, args):
     logger.info(f"Finished training on process {rank}.")
     if rank == 0:
         writer.close()
+        wandb.finish()
 
 
 def main_worker(rank, conf, output_dir, args):
