@@ -1282,6 +1282,9 @@ class MASt3R(BaseModel):
         self.head1 = transpose_to_landscape(self.downstream_head1, activate=conf.landscape_only)
         self.head2 = transpose_to_landscape(self.downstream_head2, activate=conf.landscape_only)
 
+        self.max_pool = torch.nn.MaxPool2d(kernel_size=conf.patch_size, return_indices=True)
+        self.max_unpool = torch.nn.MaxUnpool2d(conf.patch_size)
+
         to_be_frozen = {
             'none': [],
             'mask': [self.mask_token],
@@ -1328,9 +1331,6 @@ class MASt3R(BaseModel):
         data0, data1 = data
         image0, image1 = data0['image'], data1['image']
 
-        # if image0.shape[0] != 1 or image1.shape[0] != 1:
-        #     raise NotImplementedError("batched forward is not implemented yet.")
-
         # encode the two images --> B,S,D
         b, _, _, _ = image0.shape
         shape0 = data0['image_size'][:, [1, 0]] if 'image_size' in data0 else torch.tensor(image0.shape[-2:])[None].repeat(b, 1)
@@ -1367,7 +1367,7 @@ class MASt3R(BaseModel):
         if self.conf.sparse_outputs:
             max_kps = self.conf.max_num_keypoints
 
-            # for val we allow different
+            # for val we allow different max_kps
             if not self.training and self.conf.max_num_keypoints_val is not None:
                 max_kps = self.conf.max_num_keypoints_val
 
@@ -1387,7 +1387,12 @@ class MASt3R(BaseModel):
                 # Remove uncertain keypoints
                 valid_mask &= (pred['keypoint_scores'] >= self.conf.confidence_threshold)
                 
-                # Select k keypoints
+                # First, find best pixel in each 16x16 tile by non-maximum surpression,
+                # input should be (n, c, h, w)
+                mp_scores, mp_indices = self.max_pool(pred['keypoint_scores'] * valid_mask)
+                mp_mask = self.max_unpool(mp_scores, mp_indices).bool()
+                valid_mask &= mp_mask
+                # Then, select k keypoints from the best pixels.
                 if self.conf.randomize_keypoints_training and self.training:
                     # instead of selecting top-k, sample k by score weights
                     valid_mask &= sample_k_mask(pred['keypoint_scores'] * valid_mask, max_kps)
