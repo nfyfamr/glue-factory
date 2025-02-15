@@ -598,12 +598,11 @@ def training(rank, conf, output_dir, args):
                                 writer.add_figure(
                                     f"figures/{i}_{name}", fig, tot_n_samples
                                 )
-                                buf = io.BytesIO()
-                                fig.savefig(buf, format="PNG", bbox_inches='tight')
-                                buf.seek(0)
-                                pil_image = Image.open(buf)
-                                wandb.log({f"figures/{i}_{name}": wandb.Image(pil_image)}, commit=False)
-                                buf.close()
+                                with io.BytesIO() as buf:
+                                    fig.savefig(buf, format="PNG", bbox_inches='tight')
+                                    buf.seek(0)
+                                    pil_image = Image.open(buf)
+                                    wandb.log({f"figures/{i}_{name}": wandb.Image(pil_image)}, commit=False)
                 torch.cuda.empty_cache()  # should be cleared at the first iter
 
             if (tot_it % conf.train.save_every_iter == 0 and tot_it > 0) and rank == 0:
