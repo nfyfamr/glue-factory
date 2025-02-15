@@ -58,7 +58,7 @@ import logging
 from torch.utils.checkpoint import checkpoint
 
 from gluefactory.models.base_model import BaseModel
-
+from gluefactory.models.utils.device import dynamic_custom_fwd
 
 def MLP(channels, do_bn=True):
     n = len(channels)
@@ -72,7 +72,7 @@ def MLP(channels, do_bn=True):
     return nn.Sequential(*layers)
 
 
-@torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+@dynamic_custom_fwd(cast_inputs=torch.float32)
 def normalize_keypoints(kpts, size=None, shape=None):
     if size is None:
         assert shape is not None

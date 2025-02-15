@@ -10,6 +10,7 @@ from torch import nn
 from ...settings import DATA_PATH
 from ..base_model import BaseModel
 from ..utils.metrics import matcher_metrics
+from ..utils.device import dynamic_custom_fwd
 
 warnings.filterwarnings("ignore", category=UserWarning)
 ETH_EPS = 1e-8
@@ -514,7 +515,7 @@ class EndPtEncoder(nn.Module):
         return self.encoder(torch.cat(inputs, dim=1))
 
 
-@torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+@dynamic_custom_fwd(cast_inputs=torch.float32)
 def attention(query, key, value):
     dim = query.shape[1]
     scores = torch.einsum("bdhn,bdhm->bhnm", query, key) / dim**0.5

@@ -12,13 +12,14 @@ from torch.utils.checkpoint import checkpoint
 from ...settings import DATA_PATH
 from ..utils.losses import NLLLoss
 from ..utils.metrics import matcher_metrics
+from ..utils.device import dynamic_custom_fwd
 
 FLASH_AVAILABLE = hasattr(F, "scaled_dot_product_attention")
 
 torch.backends.cudnn.deterministic = True
 
 
-@torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+@dynamic_custom_fwd(cast_inputs=torch.float32)
 def normalize_keypoints(
     kpts: torch.Tensor, size: Optional[torch.Tensor] = None
 ) -> torch.Tensor:

@@ -19,7 +19,7 @@ from PIL import Image
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from torch.cuda.amp import GradScaler, autocast
+from torch import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import wandb
@@ -28,6 +28,7 @@ from . import __module_name__, logger
 from .datasets import get_dataset
 from .eval import run_benchmark
 from .models import get_model
+from .models.utils.device import get_device
 from .settings import EVAL_PATH, TRAINING_PATH
 from .utils.experiments import get_best_checkpoint, get_last_checkpoint, save_experiment
 from .utils.stdout_capturing import capture_outputs
@@ -330,7 +331,7 @@ def training(rank, conf, output_dir, args):
     optimizer = optimizer_fn(
         lr_params, lr=conf.train.lr, **conf.train.optimizer_options
     )
-    scaler = GradScaler(enabled=args.mixed_precision is not None)
+    scaler = GradScaler(get_device(model).type, enabled=args.mixed_precision is not None)
     logger.info(f"Training with mixed_precision={args.mixed_precision}")
 
     mp_dtype = {
@@ -434,7 +435,7 @@ def training(rank, conf, output_dir, args):
             model.train()
             optimizer.zero_grad()
 
-            with autocast(enabled=args.mixed_precision is not None, dtype=mp_dtype):
+            with autocast(get_device(model).type, enabled=args.mixed_precision is not None, dtype=mp_dtype):
                 data = batch_to_device(data, device, non_blocking=True)
                 pred = model(data)
                 losses, _ = loss_fn(pred, data)

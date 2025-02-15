@@ -5,6 +5,7 @@ from ...geometry.gt_generation import (
     gt_matches_from_pose_depth,
 )
 from ..base_model import BaseModel
+from ..utils.device import dynamic_custom_fwd
 
 
 class DepthMatcher(BaseModel):
@@ -37,7 +38,7 @@ class DepthMatcher(BaseModel):
                 "valid_lines1",
             ]
 
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    @dynamic_custom_fwd(cast_inputs=torch.float32)
     def _forward(self, data):
         result = {}
         if self.conf.use_points:
