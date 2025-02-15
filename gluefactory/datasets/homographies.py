@@ -25,7 +25,7 @@ from ..geometry.homography import (
 )
 from ..models.cache_loader import CacheLoader, pad_local_features
 from ..settings import DATA_PATH
-from ..utils.image import read_image
+from ..utils.image import read_image, ImagePreprocessor
 from ..utils.tools import fork_rng
 from ..visualization.viz2d import plot_image_grid
 from .augmentations import IdentityAugmentation, augmentations
@@ -57,6 +57,7 @@ class HomographyDataset(BaseDataset):
         "shuffle_seed": 0,  # or None to skip
         # image loading
         "grayscale": False,
+        "preprocessing": ImagePreprocessor.default_conf,
         "triplet": False,
         "right_only": False,  # image0 is orig (rescaled), image1 is right
         "reseed": False,
@@ -172,6 +173,8 @@ class _Dataset(torch.utils.data.Dataset):
         if conf.load_features.do:
             self.feature_loader = CacheLoader(conf.load_features)
 
+        self.preprocessor = ImagePreprocessor(conf.preprocessing)
+
     def _transform_keypoints(self, features, data):
         """Transform keypoints by a homography, threshold them,
         and potentially keep only the best ones."""
@@ -223,6 +226,18 @@ class _Dataset(torch.utils.data.Dataset):
         gs = data["image"].new_tensor([0.299, 0.587, 0.114]).view(3, 1, 1)
         if self.conf.grayscale:
             data["image"] = (data["image"] * gs).sum(0, keepdim=True)
+
+        data = {
+            **data,
+            **self.preprocessor(data["image"])
+        }
+        
+        # Update homography matrix
+        if "transform" in data:
+            data["H_"] = data["transform"] @ data["H_"] @ np.linalg.inv(data["transform"])
+            coords_h = np.hstack([data["coords"], np.ones((data["coords"].shape[0], 1))])
+            coords_h = coords_h @ data["transform"].T
+            data["coords"] = coords_h[:, :2]
 
         if self.conf.load_features.do:
             features = self.feature_loader({k: [v] for k, v in data.items()})
