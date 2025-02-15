@@ -7,5 +7,6 @@
 /data/
 /outputs/
 __pycache__
-/wandb/
+wandb/
 *.o
+*.so

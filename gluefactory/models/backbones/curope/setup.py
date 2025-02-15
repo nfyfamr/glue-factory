@@ -18,6 +18,12 @@ all_cuda_archs = cuda.get_gencode_flags().replace('compute=','arch=').split()
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
+class CustomBuildExtension(BuildExtension):
+    def build_extension(self, ext):
+        self.build_temp = os.path.join(current_dir, 'build_temp')
+        self.build_lib = current_dir
+        super().build_extension(ext)
+
 setup(
     name = 'curope',
     ext_modules = [
@@ -33,5 +39,5 @@ setup(
                 )
     ],
     cmdclass = {
-        'build_ext': BuildExtension
+        'build_ext': CustomBuildExtension
     })

@@ -15,11 +15,15 @@ Glue Factory runs with Python 3 and [PyTorch](https://pytorch.org/). The followi
 ```bash
 git clone https://github.com/cvg/glue-factory
 cd glue-factory
+conda create -n glue-factory python=3.10
+conda activate glue-factory
 python3 -m pip install -e .  # editable mode
 ```
 Some advanced features might require installing the full set of dependencies:
 ```bash
+conda install anaconda::tbb=2020.2 anaconda::cmake conda-forge::eigen conda-forge::ceres-solver  # install additional libraries if needeed during pip install process.
 python3 -m pip install -e .[extra]
+python gluefactory/models/backbones/curope/setup.py build_ext  # install curope
 ```
 
 All models and datasets in gluefactory have auto-downloaders, so you can get started right away!
