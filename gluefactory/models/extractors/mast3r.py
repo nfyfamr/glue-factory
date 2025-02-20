@@ -1139,7 +1139,7 @@ def sample_k_mask(scores, k):
     indices = torch.multinomial(scores.view(b, -1), k, replacement=False)
     mask = torch.zeros_like(scores, dtype=torch.bool)
     b_indices = torch.arange(b, device=scores.device).unsqueeze(1)
-    mask.view(-1)[b_indices, indices] = True
+    mask.view(b, -1)[b_indices, indices] = True
     return mask
 
 
