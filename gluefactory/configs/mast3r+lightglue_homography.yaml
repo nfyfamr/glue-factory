@@ -20,8 +20,10 @@ model:
         name: extractors.mast3r
         sparse_outputs: True
         dense_outputs: False
-        max_num_keypoints: 2048
+        max_num_keypoints: 512
         force_num_keypoints: True
+        randomize_keypoints: True
+        tiling_keypoints: False
         confidence_threshold: 0
         trainable: False
     ground_truth:
@@ -38,7 +40,7 @@ train:
     seed: 0
     epochs: 40
     log_every_iter: 100
-    eval_every_iter: 5000
+    eval_every_iter: 500
     lr: 1e-4
     lr_schedule:
         start: 20

@@ -1175,6 +1175,7 @@ class MASt3R(BaseModel):
         "two_confs": True,
         "desc_conf_mode": ('exp', 0, float('inf')),
         "max_num_keypoints": -1,
+        "tiling_keypoints": False,
         "max_num_keypoints_val": None,
         "force_num_keypoints": False,
         "confidence_threshold": 1.001,
@@ -1182,7 +1183,7 @@ class MASt3R(BaseModel):
         "sparse_outputs": False,
         "dense_outputs": True,
         "weights": None,  # local path of pretrained weights
-        "randomize_keypoints_training": False,
+        "randomize_keypoints": True,
         # DUSt3R
         "output_mode": 'pts3d+desc24',
         "head_type": 'catmlp+dpt',
@@ -1389,11 +1390,12 @@ class MASt3R(BaseModel):
                 
                 # First, find best pixel in each 16x16 tile by non-maximum surpression,
                 # input should be (n, c, h, w)
-                mp_scores, mp_indices = self.max_pool(pred['keypoint_scores'] * valid_mask)
-                mp_mask = self.max_unpool(mp_scores, mp_indices).bool()
-                valid_mask &= mp_mask
+                if self.conf.tiling_keypoints:
+                    mp_scores, mp_indices = self.max_pool(pred['keypoint_scores'] * valid_mask)
+                    mp_mask = self.max_unpool(mp_scores, mp_indices).bool()
+                    valid_mask &= mp_mask
                 # Then, select k keypoints from the best pixels.
-                if self.conf.randomize_keypoints_training and self.training:
+                if self.conf.randomize_keypoints and valid_mask.sum() > 0:
                     # instead of selecting top-k, sample k by score weights
                     valid_mask &= sample_k_mask(pred['keypoint_scores'] * valid_mask, max_kps)
                 else:
