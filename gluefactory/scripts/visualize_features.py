@@ -11,9 +11,11 @@ from ..datasets import get_dataset
 from ..models import get_model
 from ..settings import DATA_PATH, VIZ_PATH
 from ..utils.export_predictions import export_predictions
-from ..utils.tools import fork_rng
+from ..utils.tools import fork_rng, PCA
 from ..utils.tensor import batch_to_device
-from ..visualization.viz2d import plot_image_grid, plot_keypoints, save_plot
+from ..utils.patches import get_top_patches
+from ..visualization.viz2d import plot_image_grid, plot_keypoints, save_plot, plot_attentions
+import numpy as np
 
 
 dataset_configs = {
@@ -81,28 +83,53 @@ def sample_and_render_features(loader, model, device, export_root, num_items, dp
         for it, data in zip(tqdm(range(num_items)), loader):
             data = batch_to_device(data, device, non_blocking=True)
             pred = model(data)
+            pred["descriptors_pca0"] = PCA(pred["dense_descriptors0"])
+            pred["descriptors_pca1"] = PCA(pred["dense_descriptors1"])
+
+            # Select patches with the highest confidence
+            pred["patches0"] = get_top_patches(pred["dense_keypoint_scores0"], num_patches=1, patch_size=model.extractor.conf.patch_size)
+            pred["patches1"] = get_top_patches(pred["dense_keypoint_scores1"], num_patches=1, patch_size=model.extractor.conf.patch_size)
 
             pred = batch_to_device(pred, "cpu", non_blocking=False)
             data = batch_to_device(data, "cpu", non_blocking=False)
 
             images = []
-            images.append(
-                [
-                    data["view0"]["image"][0].permute(1, 2, 0),
-                    pred['dense_keypoint_scores0'][0],
-                    data["view1"]["image"][0].permute(1, 2, 0),
-                    pred['dense_keypoint_scores1'][0],
-                ]
-            )
-
             kpts = []
-            kpts.append([pred['keypoints0'][0], pred['keypoints0'][0], pred['keypoints1'][0], pred['keypoints1'][0]])
+            for v in [0, 1]:
+                images.append(
+                    [
+                        data[f"view{v}"]["image"][0].permute(1, 2, 0),
+                        pred[f"dense_keypoint_scores{v}"][0],
+                        np.tile(np.histogram(pred[f"dense_keypoint_scores{v}"][0].flatten(), bins=50)[0], (50, 1)),
+                        pred[f"descriptors_pca{v}"][0],
+                        pred[f"pointcloud{v}"][0][..., 2],
+                        pred[f"pointcloud_scores{v}"][0],
+                    ]
+                )
+                kpts.append(
+                    [
+                        pred[f"keypoints{v}"][0],
+                        pred[f"keypoints{v}"][0]
+                    ]
+                )
 
             fig, axes = plot_image_grid(images, dpi=dpi, cmaps="inferno", return_fig=True)
-            [plot_keypoints(kpts[i], axes=axes[i], colors="royalblue") for i in range(1)]
+            [plot_keypoints(kpts[i], axes=axes[i], colors="royalblue") for i in range(len(kpts))]
             save_plot(export_root / f"{it:03}_idx_{data['idx'].item()}.png")
             plt.close("all")
 
+            # Draw new figure for attention map
+            img0 = data["view0"]["image"][0].permute(1, 2, 0)
+            img1 = data["view1"]["image"][0].permute(1, 2, 0)
+            images = [[img0, img1] for _ in range(model.extractor.conf.dec_depth)]
+            
+            fig, axes = plot_image_grid(images, return_fig=True, set_lim=True)
+            for i in range(model.extractor.conf.dec_depth):
+                plot_attentions(pred["attentions0"][i][0], patch_indices=pred["patches0"][0], image_size=data[f"view{v}"]["image"][0].shape[1:], patch_size=model.extractor.conf.patch_size, axes=axes[i], reverse=False, cmap="Purples", lw=0.5, ps=0)
+                plot_attentions(pred["attentions1"][i][0], patch_indices=pred["patches1"][0], image_size=data[f"view{v}"]["image"][0].shape[1:], patch_size=model.extractor.conf.patch_size, axes=axes[i], reverse=True, cmap="Oranges", lw=0.5, ps=0)
+
+            save_plot(export_root / f"{it:03}_idx_{data['idx'].item()}_attn.png")
+            plt.close("all")
 
 def visualize(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"

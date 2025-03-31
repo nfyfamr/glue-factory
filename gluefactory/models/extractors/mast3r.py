@@ -224,6 +224,29 @@ class CrossAttention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+    def _forward(self, query, key, value, qpos, kpos):
+        B, Nq, C = query.shape
+        Nk = key.shape[1]
+        Nv = value.shape[1]
+        
+        q = self.projq(query).reshape(B,Nq,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        k = self.projk(key).reshape(B,Nk,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        v = self.projv(value).reshape(B,Nv,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        
+        if self.rope is not None:
+            q = self.rope(q, qpos)
+            k = self.rope(k, kpos)
+            
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, Nq, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        return x, attn
+
 class DecoderBlock(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
@@ -245,7 +268,17 @@ class DecoderBlock(nn.Module):
         x = x + self.drop_path(self.cross_attn(self.norm2(x), y_, y_, xpos, ypos))
         x = x + self.drop_path(self.mlp(self.norm3(x)))
         return x, y
+
+    def _forward(self, x, y, xpos, ypos):
+        x = x + self.drop_path(self.attn(self.norm1(x), xpos))
+        y_ = self.norm_y(y)
         
+        cross_output, attn_map = self.cross_attn._forward(self.norm2(x), y_, y_, xpos, ypos)
+        
+        x = x + self.drop_path(cross_output)
+        x = x + self.drop_path(self.mlp(self.norm3(x)))
+        
+        return x, y, attn_map
         
 # patch embedding
 class PositionGetter(object):
@@ -1182,6 +1215,8 @@ class MASt3R(BaseModel):
         "remove_borders": None,
         "sparse_outputs": False,
         "dense_outputs": True,
+        "points_outputs": False,
+        "attention_outputs": False,
         "weights": None,  # local path of pretrained weights
         "randomize_keypoints": True,
         # DUSt3R
@@ -1328,6 +1363,27 @@ class MASt3R(BaseModel):
         
         return zip(*final_output)
 
+    def _decode_image(self, f0, f1, pos0, pos1):
+        final_output = [(f0, f1)]  # before projection
+        attn_maps = []  # Store attention maps
+
+        # project to decoder dim
+        f0 = self.decoder_embed(f0)
+        f1 = self.decoder_embed(f1)
+        
+        final_output.append((f0, f1))
+        for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
+            f0, _, attn_map_1 = blk1._forward(*final_output[-1][::+1], pos0, pos1)  # img1 side
+            f1, _, attn_map_2 = blk2._forward(*final_output[-1][::-1], pos1, pos0)  # img2 side
+            final_output.append((f0, f1))
+            attn_maps.append((attn_map_1, attn_map_2))
+        
+        # normalize last output
+        del final_output[1]  # duplicate with final_output[0]
+        final_output[-1] = tuple(map(self.dec_norm, final_output[-1]))
+        
+        return zip(*final_output), zip(*attn_maps)
+
     def _forward(self, data):
         data0, data1 = data
         image0, image1 = data0['image'], data1['image']
@@ -1346,8 +1402,15 @@ class MASt3R(BaseModel):
             feat0, pos0 = self.encode_image(image0, shape0)
             feat1, pos1 = self.encode_image(image1, shape1)
 
+        pred0, pred1 = {}, {}
+
         # combine all ref images into object-centric representation
-        feat0, feat1 = self.decode_image(feat0, feat1, pos0, pos1)
+        if self.conf.attention_outputs:
+            (feat0, feat1), (attn_map0, attn_map1) = self._decode_image(feat0, feat1, pos0, pos1)
+            pred0["attentions"] = attn_map0
+            pred1["attentions"] = attn_map1
+        else:
+            feat0, feat1 = self.decode_image(feat0, feat1, pos0, pos1)
 
         # dense feature description
         with torch.amp.autocast(device_type=feat0[0].device.type, enabled=False):
@@ -1358,12 +1421,26 @@ class MASt3R(BaseModel):
             # "keypoints": get_image_coords(image0),
             "keypoint_scores": res0['desc_conf'],
             "descriptors": res0['desc'],
+            **pred0,
         }
         pred1 = {
             # "keypoints": get_image_coords(image1),
             "keypoint_scores": res1['desc_conf'],
             "descriptors": res1['desc'],
+            **pred1,
         }
+
+        if self.conf.points_outputs:
+            pred0 = {
+                "pointcloud": res0['pts3d'],
+                "pointcloud_scores": res0['conf'],
+                **pred0,
+            }
+            pred1 = {
+                "pointcloud": res1['pts3d'],
+                "pointcloud_scores": res1['conf'],
+                **pred1,
+            }
 
         if self.conf.sparse_outputs:
             max_kps = self.conf.max_num_keypoints

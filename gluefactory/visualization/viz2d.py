@@ -10,6 +10,7 @@ import matplotlib.patheffects as path_effects
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
+import torch
 
 
 def cm_ranking(sc, ths=[512, 1024, 2048, 4096]):
@@ -484,3 +485,56 @@ def plot_cumulative(
     plt.tight_layout()
 
     return plt.gcf()
+
+def plot_attentions(attn_map, patch_indices, image_size, patch_size=16, reverse=False, axes=None, cmap="Purples", **kw):
+    """ Visualizes attention mappings between two images.
+    Args:
+        attn_map: attention map of size (head, gh*gw, gh*gw)
+        patch_indices: indices of the patches for drawing attention mappings, with a size of (N, 2).
+        image_size: original image size.
+        reverse: switch src and dst of images
+    """
+    if axes is None:
+        axes = plt.gcf().axes
+
+    if reverse:
+        axes[0], axes[1] = axes[1], axes[0]
+
+    N, _ = patch_indices.shape
+    n_heads, gs, _ = attn_map.shape
+    gh, gw = image_size[0] // patch_size, image_size[1] // patch_size
+
+    patch_flat_indices = patch_indices[:, 1] * gw + patch_indices[:, 0]  # (N,)
+    attn_scores = attn_map[:, patch_flat_indices, :]  # (n_heads, N, gh*gw)
+    max_indices = attn_scores.argmax(dim=-1)  # (n_heads, N)
+    max_values = torch.gather(attn_scores, dim=-1, index=max_indices.unsqueeze(-1)).squeeze(-1)
+
+    # Tranpose to (N, n_heads)
+    max_values = max_values.permute(1, 0)
+    max_indices = max_indices.permute(1, 0)
+
+    # Pixel coordinates of patch centers
+    points0 = patch_indices * patch_size + patch_size // 2
+    points1 = torch.stack((max_indices % gw, max_indices // gw), dim=-1)  # (N, n_heads, 2)
+    points1 = points1 * patch_size + patch_size // 2
+
+    kpm0 = points0.repeat_interleave(n_heads, 0)  # (n_heads * N, 2)
+    kpm1 = points1.reshape(-1, 2)  # (n_heads * N, 2)
+
+    cmap = plt.get_cmap(cmap)
+    rgb_colors = cmap(max_values)
+    rgb_colors[:, :, 3] = max_values
+    rgb_colors = rgb_colors.reshape(-1, rgb_colors.shape[-1])
+    rgb_tuples = [tuple(map(float, c)) for c in rgb_colors]
+
+    plot_matches(kpm0, kpm1, color=rgb_tuples, axes=axes, **kw)
+
+    # Add rectangles for patches
+    for ax, points in zip(axes, [points0, points1.reshape(-1, 2)]):
+        for (x, y) in points:
+            rect = matplotlib.patches.Rectangle((x - patch_size // 2, y - patch_size // 2), patch_size, patch_size,
+                             linewidth=0.5, edgecolor=cmap(1.), facecolor='none')
+            ax.add_patch(rect)
+
+    if reverse:
+        axes[0], axes[1] = axes[1], axes[0]

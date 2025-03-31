@@ -48,3 +48,15 @@ def build_heatmap(img, patches, corners):
     draw_image_patches(hmap, patches, corners.long())
     hmap = hmap.squeeze(1)
     return hmap, (hmap > 0.0).float()  # bxhxw
+
+
+def get_top_patches(conf_map, num_patches=3, patch_size=16):
+    """Finds the top N patches with the highest confidence scores."""
+    b, h, w = conf_map.shape
+    unfolded = conf_map.unfold(1, patch_size, patch_size).unfold(2, patch_size, patch_size)  # (b, gh, hw, p, p)
+    max_conf_scores = unfolded.max(dim=4)[0].max(dim=3)[0]
+    top_scores, top_indices = max_conf_scores.view(b, -1).topk(num_patches, dim=1)
+    gw = max_conf_scores.shape[2]
+    row_indices = top_indices // gw
+    col_indices = top_indices % gw
+    return torch.stack((col_indices, row_indices), dim=2)

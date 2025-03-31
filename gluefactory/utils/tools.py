@@ -206,6 +206,21 @@ def get_class(mod_path, BaseClass):
     return classes[0][1]
 
 
+def get_classes(mod_path, BaseClass):
+    """Get the class object which inherits from BaseClass and is defined in
+    the module named mod_name, child of base_path.
+    """
+    import inspect
+
+    mod = __import__(mod_path, fromlist=[""])
+    classes = inspect.getmembers(mod, inspect.isclass)
+    # Filter classes defined in the module
+    classes = [c for c in classes if c[1].__module__ == mod_path]
+    # Filter classes inherited from BaseModel
+    classes = [c for c in classes if issubclass(c[1], BaseClass)]
+    return classes
+
+
 def set_num_threads(nt):
     """Force numpy and other libraries to use a limited number of threads."""
     try:
@@ -267,3 +282,37 @@ def fork_rng(seed=None, with_cuda=True):
         yield
     finally:
         set_random_state(state)
+
+
+def PCA(x, num_components=3):
+    """
+    Principal Component Analysis
+    
+    Args:
+        x: Image tensor of shape (B, H, W, D).
+        num_components: Number of principal components to retain.
+        
+    Returns:
+        Tensor of shape (B, H, W, num_components) with PCA-projected features.
+    """
+    assert isinstance(x, torch.Tensor)
+    B, H, W, D = x.shape
+
+    flat_features = x.view(B, -1, D)  # Shape: (B, HW, D)
+
+    mean = flat_features.mean(dim=1, keepdim=True)
+    centered_features = flat_features - mean
+    cov_matrix = torch.matmul(centered_features.transpose(1, 2), centered_features) / (H * W - 1)
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(cov_matrix)  # Shape: (B, D), (B, D, D)
+    sorted_indices = torch.argsort(eigenvalues, descending=True)
+    eigenvectors = torch.gather(eigenvectors, 2, sorted_indices.unsqueeze(1).expand(-1, D, -1))
+
+    pca_projection_matrix = eigenvectors[:, :, :num_components]  # Shape: (B, D, 3)
+    pca_features = torch.matmul(centered_features, pca_projection_matrix)  # Shape: (B, HW, 3)
+
+    pca_features -= pca_features.min(dim=1, keepdim=True)[0]
+    pca_features /= pca_features.max(dim=1, keepdim=True)[0] + 1e-5
+    pca_images = pca_features.view(B, H, W, num_components)
+
+    return pca_images
