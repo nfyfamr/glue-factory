@@ -402,13 +402,13 @@ class KeyCorrection(nn.Module):
         self.head = nn.Conv2d(64, output_dim, kernel_size=1)
 
     def forward(self, feat0, feat1, m0):
-        feat0 = feat0.permute(0, 2, 3, 4, 1)  # (b, d, m, p, p) -> (b, m, p, p, d)
-        feat1 = feat1.permute(0, 2, 3, 4, 1)
+        feat0 = feat0.permute(0, 2, 3, 4, 1).contiguous()  # (b, d, m, p, p) -> (b, m, p, p, d)
+        feat1 = feat1.permute(0, 2, 3, 4, 1).contiguous()
         b, m, p, _, d = feat0.shape
         
         feat1 = feat1[torch.arange(b)[:, None], m0, ...]
         f = torch.cat([feat0, feat1], dim=-1)  # (b, m, p, p, 2*d)
-        f = f.permute(0, 1, 4, 2, 3).view(b*m, 2*d, p, p)
+        f = f.permute(0, 1, 4, 2, 3).contiguous().view(b*m, 2*d, p, p)
 
         e1 = self.enc1(f)  # (bm, 64, 16, 16)
         e2 = self.pool(e1)  # (bm, 64, 8, 8)
@@ -427,7 +427,7 @@ class KeyCorrection(nn.Module):
         d2 = self.dec2(d2)  # (bm, 64, 16, 16)
         
         out = self.head(d2)  # (bm, 3, 16, 16)
-        out = out.view(b, m, 3, p, p).permute(0, 1, 3, 4, 2)  # (b, m, p, p, 3)
+        out = out.view(b, m, 3, p, p).permute(0, 1, 3, 4, 2).contiguous()  # (b, m, p, p, 3)
         offset, conf = out[..., :2], out[..., 2]
         return offset, conf
 
@@ -661,19 +661,19 @@ class MagicGlue(nn.Module):
             kpts1[torch.arange(b)[:, None], m0, ...][valid_mask0] = (kpts1[torch.arange(b)[:, None], m0, ...] + shift1)[valid_mask0]
 
             desc0 = F.grid_sample(
-                data["dense_descriptors0"].permute(0, 3, 1, 2),  # (b, d, h, w)
+                data["dense_descriptors0"].permute(0, 3, 1, 2).contiguous(),  # (b, d, h, w)
                 kpts0.unsqueeze(2),  # (b, m, 1, 2)
                 mode=self.conf.key_sample_mode,
                 padding_mode="zeros",
                 align_corners=True,
-            ).squeeze(-1).permute(0, 2, 1)  # (b, m, d)
+            ).squeeze(-1).permute(0, 2, 1).contiguous()  # (b, m, d)
             desc1 = F.grid_sample(
-                data["dense_descriptors1"].permute(0, 3, 1, 2),  # (b, d, h, w)
+                data["dense_descriptors1"].permute(0, 3, 1, 2).contiguous(),  # (b, d, h, w)
                 kpts1.unsqueeze(2),  # (b, n, 1, 2)
                 mode=self.conf.key_sample_mode,
                 padding_mode="zeros",
                 align_corners=True,
-            ).squeeze(-1).permute(0, 2, 1)  # (b, n, d)
+            ).squeeze(-1).permute(0, 2, 1).contiguous()  # (b, n, d)
 
             # Fine matching
             desc0 = self.input_proj[blk](desc0)
@@ -805,7 +805,7 @@ class MagicGlue(nn.Module):
         sampling_grid = sampling_grid.view(b, n*patch_size*patch_size, 1, 2)  # (b, n*p*p, 1, 2)
         
         patches = torch.zeros(b, d, n, patch_size, patch_size, device=kpts.device)  # (b, d, n, p, p)
-        desc = desc.permute(0, 3, 1, 2)  # (b, d, h, w)
+        desc = desc.permute(0, 3, 1, 2).contiguous()  # (b, d, h, w)
         for i in range(b):
             batch_patches = F.grid_sample(
                 desc[i].unsqueeze(0),  # (1, d, h, w)

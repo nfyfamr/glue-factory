@@ -189,7 +189,12 @@ def pack_lr_parameters(params, base_lr, lr_scaling):
     return lr_params
 
 
-def training(rank, conf, output_dir, args):
+def training(conf, output_dir, args):
+    distributed = 'RANK' in os.environ
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    global_rank = int(os.environ.get('RANK', 0))
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+
     if args.restore:
         logger.info(f"Restoring from previous training of {args.experiment}")
         try:
@@ -230,8 +235,8 @@ def training(rank, conf, output_dir, args):
             init_cp = None
 
     OmegaConf.set_struct(conf, True)  # prevent access to unknown entries
-    set_seed(conf.train.seed)
-    if rank == 0:
+    set_seed(conf.train.seed + global_rank)
+    if global_rank == 0:
         writer = SummaryWriter(log_dir=str(output_dir))
         if os.getenv("WANDB_API_KEY") or os.path.exists(os.path.expanduser("~/.netrc")):
             wandb_mode = "online"
@@ -241,26 +246,22 @@ def training(rank, conf, output_dir, args):
         wandb.init(project='gluefactory', config={"experiment": args.experiment, "conf": OmegaConf.to_container(conf)}, mode=wandb_mode)
 
     data_conf = copy.deepcopy(conf.data)
-    if args.distributed:
-        logger.info(f"Training in distributed mode with {args.n_gpus} GPUs")
+    if distributed:
+        logger.info(f"Training in DDP mode (rank {global_rank}/{world_size})")
         assert torch.cuda.is_available()
-        device = rank
-        torch.distributed.init_process_group(
-            backend="nccl",
-            world_size=args.n_gpus,
-            rank=device,
-            init_method="file://" + str(args.lock_file),
-        )
-        torch.cuda.set_device(device)
+        device = local_rank
+        # torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        torch.distributed.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
 
         # adjust batch size and num of workers since these are per GPU
         if "batch_size" in data_conf:
-            data_conf.batch_size = int(data_conf.batch_size / args.n_gpus)
+            data_conf.batch_size = int(data_conf.batch_size / world_size)
         if "train_batch_size" in data_conf:
-            data_conf.train_batch_size = int(data_conf.train_batch_size / args.n_gpus)
+            data_conf.train_batch_size = int(data_conf.train_batch_size / world_size)
         if "num_workers" in data_conf:
             data_conf.num_workers = int(
-                (data_conf.num_workers + args.n_gpus - 1) / args.n_gpus
+                (data_conf.num_workers + world_size - 1) / world_size
             )
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -280,13 +281,13 @@ def training(rank, conf, output_dir, args):
     if args.overfit:
         # we train and eval with the same single training batch
         logger.info("Data in overfitting mode")
-        assert not args.distributed
+        assert not distributed
         train_loader = dataset.get_overfit_loader("train")
         val_loader = val_dataset.get_overfit_loader("val")
     else:
-        train_loader = dataset.get_data_loader("train", distributed=args.distributed)
+        train_loader = dataset.get_data_loader("train", distributed=distributed)
         val_loader = val_dataset.get_data_loader("val")
-    if rank == 0:
+    if global_rank == 0:
         logger.info(f"Training loader has {len(train_loader)} batches")
         logger.info(f"Validation loader has {len(val_loader)} batches")
 
@@ -306,10 +307,10 @@ def training(rank, conf, output_dir, args):
     loss_fn = model.loss
     if init_cp is not None:
         model.load_state_dict(init_cp["model"], strict=False)
-    if args.distributed:
+    if distributed:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device])
-    if rank == 0 and args.print_arch:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+    if global_rank == 0 and args.print_arch:
         logger.info(f"Model: \n{model}")
 
     torch.backends.cudnn.benchmark = True
@@ -348,7 +349,7 @@ def training(rank, conf, output_dir, args):
         if "lr_scheduler" in init_cp:
             lr_scheduler.load_state_dict(init_cp["lr_scheduler"])
 
-    if rank == 0:
+    if global_rank == 0:
         logger.info(
             "Starting training with configuration:\n%s", OmegaConf.to_yaml(conf)
         )
@@ -361,7 +362,7 @@ def training(rank, conf, output_dir, args):
         p.export_chrome_trace("trace_" + str(p.step_num) + ".json")
         p.export_stacks("/tmp/profiler_stacks.txt", "self_cuda_time_total")
 
-    if args.profile:
+    if args.profile and global_rank == 0:
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(wait=1, warmup=1, active=1, repeat=1),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(str(output_dir)),
@@ -371,12 +372,12 @@ def training(rank, conf, output_dir, args):
         )
         prof.__enter__()
     while epoch < conf.train.epochs and not stop:
-        if rank == 0:
+        if global_rank == 0:
             logger.info(f"Starting epoch {epoch}")
 
         # we first run the eval
         if (
-            rank == 0
+            global_rank == 0
             and epoch % conf.train.test_every_epoch == 0
             and args.run_benchmarks
         ):
@@ -399,7 +400,7 @@ def training(rank, conf, output_dir, args):
                     writer.add_figure(f"figures/{bname}/{fig_name}", fig, epoch)
 
         # set the seed
-        set_seed(conf.train.seed + epoch)
+        set_seed(conf.train.seed + epoch * world_size + global_rank)
 
         # update learning rate
         if conf.train.lr_schedule.on_epoch and epoch > 0:
@@ -408,7 +409,7 @@ def training(rank, conf, output_dir, args):
             logger.info(
                 f'lr changed from {old_lr} to {optimizer.param_groups[0]["lr"]}'
             )
-        if args.distributed:
+        if distributed:
             train_loader.sampler.set_epoch(epoch)
         if epoch > 0 and conf.train.dataset_callback_fn and not args.overfit:
             loaders = [train_loader]
@@ -417,16 +418,14 @@ def training(rank, conf, output_dir, args):
             for loader in loaders:
                 if isinstance(loader.dataset, torch.utils.data.Subset):
                     getattr(loader.dataset.dataset, conf.train.dataset_callback_fn)(
-                        conf.train.seed + epoch
+                        conf.train.seed + epoch * world_size
                     )
                 else:
                     getattr(loader.dataset, conf.train.dataset_callback_fn)(
-                        conf.train.seed + epoch
+                        conf.train.seed + epoch * world_size
                     )
         for it, data in enumerate(train_loader):
-            tot_it = (len(train_loader) * epoch + it) * (
-                args.n_gpus if args.distributed else 1
-            )
+            tot_it = (len(train_loader) * epoch + it) * world_size
             tot_n_samples = tot_it
             if not args.log_it:
                 # We normalize the x-axis of tensorflow to num samples!
@@ -440,13 +439,18 @@ def training(rank, conf, output_dir, args):
                 pred = model(data)
                 losses, _ = loss_fn(pred, data)
                 loss = torch.mean(losses["total"])
+                # from torchviz import make_dot
+                # make_dot(loss, params=dict(list(model.named_parameters()))).render("graph_torchviz", format="png")
+                # /home/ylee236/.conda/envs/glue-factory/lib/python3.10/site-packages/graphviz/backend/execute.py#78
+                # /home/ylee236/.conda/envs/glue-factory/bin/dot
             if torch.isnan(loss).any():
-                print(f"Detected NAN, skipping iteration {it}")
+                if global_rank == 0:
+                    logger.warning(f"Detected NAN, skipping iteration {it}")
                 del pred, data, loss, losses
                 continue
 
             do_backward = loss.requires_grad
-            if args.distributed:
+            if distributed:
                 do_backward = torch.tensor(do_backward).float().to(device)
                 torch.distributed.all_reduce(
                     do_backward, torch.distributed.ReduceOp.PRODUCT
@@ -460,7 +464,8 @@ def training(rank, conf, output_dir, args):
                     detected_anomaly = False
                     for name, param in model.named_parameters():
                         if param.grad is None and param.requires_grad:
-                            print(f"param {name} has no gradient.")
+                            if global_rank == 0:
+                                logger.warning(f"Param {name} has no gradient.")
                             detected_anomaly = True
                     if detected_anomaly:
                         raise RuntimeError("Detected anomaly in training.")
@@ -474,7 +479,8 @@ def training(rank, conf, output_dir, args):
                         )
                         scaler.step(optimizer)
                     except RuntimeError:
-                        logger.warning("NaN detected in gradients. Skipping iteration.")
+                        if global_rank == 0:
+                            logger.warning("NaN detected in gradients. Skipping iteration.")
                     scaler.update()
                 else:
                     scaler.step(optimizer)
@@ -482,21 +488,21 @@ def training(rank, conf, output_dir, args):
                 if not conf.train.lr_schedule.on_epoch:
                     lr_scheduler.step()
             else:
-                if rank == 0:
+                if global_rank == 0:
                     logger.warning(f"Skip iteration {it} due to detach.")
 
-            if args.profile:
+            if args.profile and global_rank == 0:
                 prof.step()
 
             if it % conf.train.log_every_iter == 0:
                 for k in sorted(losses.keys()):
-                    if args.distributed:
+                    if distributed:
                         losses[k] = losses[k].sum(-1)
                         torch.distributed.reduce(losses[k], dst=0)
-                        losses[k] /= train_loader.batch_size * args.n_gpus
+                        losses[k] /= train_loader.batch_size * world_size
                     losses[k] = torch.mean(losses[k], -1)
                     losses[k] = losses[k].item()
-                if rank == 0:
+                if global_rank == 0:
                     str_losses = [f"{k} {v:.3E}" for k, v in losses.items()]
                     logger.info(
                         "[E {} | it {}] loss {{{}}}".format(
@@ -517,7 +523,7 @@ def training(rank, conf, output_dir, args):
                     }, commit=False)
 
             if conf.train.log_grad_every_iter is not None:
-                if it % conf.train.log_grad_every_iter == 0:
+                if it % conf.train.log_grad_every_iter == 0 and global_rank == 0:
                     grad_txt = ""
                     grad_dict = {}
                     for name, param in model.named_parameters():
@@ -550,10 +556,10 @@ def training(rank, conf, output_dir, args):
                         device,
                         loss_fn,
                         conf.train,
-                        pbar=(rank == -1),
+                        pbar=(global_rank == -1),
                     )
 
-                if rank == 0:
+                if global_rank == 0:
                     str_results = [
                         f"{k} {v:.3E}"
                         for k, v in results.items()
@@ -588,7 +594,7 @@ def training(rank, conf, output_dir, args):
                             tot_it,
                             output_dir,
                             stop,
-                            args.distributed,
+                            distributed,
                             cp_name="checkpoint_best.tar",
                         )
                         logger.info(f"New best val: {conf.train.best_key}={best_eval}")
@@ -605,7 +611,7 @@ def training(rank, conf, output_dir, args):
                                     wandb.log({f"figures/{i}_{name}": wandb.Image(pil_image)}, commit=False)
                 torch.cuda.empty_cache()  # should be cleared at the first iter
 
-            if (tot_it % conf.train.save_every_iter == 0 and tot_it > 0) and rank == 0:
+            if (tot_it % conf.train.save_every_iter == 0 and tot_it > 0) and global_rank == 0:
                 if results is None:
                     results, _, _ = do_evaluation(
                         model,
@@ -613,7 +619,7 @@ def training(rank, conf, output_dir, args):
                         device,
                         loss_fn,
                         conf.train,
-                        pbar=(rank == -1),
+                        pbar=(global_rank == -1),
                     )
                     best_eval = results[conf.train.best_key]
                 best_eval = save_experiment(
@@ -628,16 +634,16 @@ def training(rank, conf, output_dir, args):
                     tot_it,
                     output_dir,
                     stop,
-                    args.distributed,
+                    distributed,
                 )
 
-            if rank == 0:
+            if global_rank == 0:
                 wandb.log({}, commit=True)
 
             if stop:
                 break
 
-        if rank == 0:
+        if global_rank == 0:
             best_eval = save_experiment(
                 model,
                 optimizer,
@@ -650,23 +656,17 @@ def training(rank, conf, output_dir, args):
                 tot_it,
                 output_dir=output_dir,
                 stop=stop,
-                distributed=args.distributed,
+                distributed=distributed,
             )
 
         epoch += 1
 
     logger.info(f"Finished training on process {rank}.")
-    if rank == 0:
+    if global_rank == 0:
         writer.close()
         wandb.finish()
-
-
-def main_worker(rank, conf, output_dir, args):
-    if rank == 0:
-        with capture_outputs(output_dir / "log.txt"):
-            training(rank, conf, output_dir, args)
-    else:
-        training(rank, conf, output_dir, args)
+    if distributed:
+        torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -688,7 +688,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--overfit", action="store_true")
     parser.add_argument("--restore", action="store_true")
-    parser.add_argument("--distributed", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--print_arch", "--pa", action="store_true")
     parser.add_argument("--detect_anomaly", "--da", action="store_true")
@@ -718,13 +717,8 @@ if __name__ == "__main__":
         mod_dir = Path(__import__(str(module)).__file__).parent
         shutil.copytree(mod_dir, output_dir / module, dirs_exist_ok=True)
 
-    if args.distributed:
-        args.n_gpus = torch.cuda.device_count()
-        args.lock_file = output_dir / "distributed_lock"
-        if args.lock_file.exists():
-            args.lock_file.unlink()
-        torch.multiprocessing.spawn(
-            main_worker, nprocs=args.n_gpus, args=(conf, output_dir, args)
-        )
+    if 'RANK' in os.environ and int(os.environ['RANK']) != 0:
+        training(conf, output_dir, args)
     else:
-        main_worker(0, conf, output_dir, args)
+        with capture_outputs(output_dir / "log.txt"):
+            training(conf, output_dir, args)
