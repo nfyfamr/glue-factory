@@ -197,14 +197,14 @@ def training(rank, conf, output_dir, args):
         except AssertionError:
             init_cp = get_best_checkpoint(args.experiment)
         logger.info(f"Restoring from checkpoint {init_cp.name}")
-        init_cp = torch.load(str(init_cp), map_location="cpu")
+        init_cp = torch.load(str(init_cp), map_location="cpu", weights_only=True)
         conf = OmegaConf.merge(OmegaConf.create(init_cp["conf"]), conf)
         conf.train = OmegaConf.merge(default_train_conf, conf.train)
         epoch = init_cp["epoch"] + 1
 
         # get the best loss or eval metric from the previous best checkpoint
         best_cp = get_best_checkpoint(args.experiment)
-        best_cp = torch.load(str(best_cp), map_location="cpu")
+        best_cp = torch.load(str(best_cp), map_location="cpu", weights_only=True)
         best_eval = best_cp["eval"][conf.train.best_key]
         del best_cp
     else:
@@ -220,7 +220,7 @@ def training(rank, conf, output_dir, args):
             except AssertionError:
                 init_cp = get_best_checkpoint(conf.train.load_experiment)
             # init_cp = get_last_checkpoint(conf.train.load_experiment)
-            init_cp = torch.load(str(init_cp), map_location="cpu")
+            init_cp = torch.load(str(init_cp), map_location="cpu", weights_only=True)
             # load the model config of the old setup, and overwrite with current config
             conf.model = OmegaConf.merge(
                 OmegaConf.create(init_cp["conf"]).model, conf.model
