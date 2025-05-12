@@ -1007,6 +1007,60 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d(PixelwiseTaskWithDPT):
         return out
 
 
+class MLP_LocalFeatures(nn.Module):
+    """ MLP head that outputs local features.
+    The input is a concatenation of Encoder and Decoder outputs
+    """
+
+    def __init__(self, net, has_conf=False, local_feat_dim=16, hidden_dim_factor=4., 
+                 postprocess=None, feature_dim=256, last_dim=32, head_type="regression", **kwargs):
+        super().__init__()
+        self.local_feat_dim = local_feat_dim
+        self.postprocess = postprocess
+
+        patch_size = net.patch_embed.patch_size
+        if isinstance(patch_size, tuple):
+            assert len(patch_size) == 2 and isinstance(patch_size[0], int) and isinstance(
+                patch_size[1], int), "What is your patchsize format? Expected a single int or a tuple of two ints."
+            assert patch_size[0] == patch_size[1], "Error, non square patches not managed"
+            patch_size = patch_size[0]
+        self.patch_size = patch_size
+
+        self.desc_mode = net.conf.desc_mode
+        self.has_conf = has_conf
+        self.two_confs = net.conf.two_confs  # independent confs for 3D regr and descs
+        self.desc_conf_mode = net.conf.desc_conf_mode
+        idim = net.conf.enc_embed_dim + net.conf.dec_embed_dim
+
+        self.head_local_features = Mlp(in_features=idim,
+                                     hidden_features=int(hidden_dim_factor * idim),
+                                     out_features=(self.local_feat_dim + self.two_confs) * self.patch_size**2)
+
+    def forward(self, decout, img_shape):
+        # recover encoder and decoder outputs
+        enc_output, dec_output = decout[0], decout[-1]
+        cat_output = torch.cat([enc_output, dec_output], dim=-1)  # concatenate
+        H, W = img_shape
+        B, S, D = cat_output.shape
+
+        # extract local_features
+        local_features = self.head_local_features(cat_output)  # B,S,D
+        local_features = local_features.transpose(-1, -2).view(B, -1, H // self.patch_size, W // self.patch_size)
+        local_features = F.pixel_shuffle(local_features, self.patch_size)  # B,d,H,W
+
+        # post process descriptors and confidences
+        out = local_features
+        if self.postprocess:
+            out = self.postprocess(out,
+                                 depth_mode=None,
+                                 conf_mode=None,
+                                 desc_dim=self.local_feat_dim,
+                                 desc_mode=self.desc_mode,
+                                 two_confs=self.two_confs,
+                                 desc_conf_mode=self.desc_conf_mode)
+        return out
+
+
 def reg_dense_depth(xyz, mode):
     """
     extract 3D points from prediction head output
@@ -1054,19 +1108,26 @@ def reg_desc(desc, mode):
     return desc
 
 
-def postprocess(out, depth_mode, conf_mode, desc_dim=None, desc_mode='norm', two_confs=False, desc_conf_mode=None):
+def postprocess(out, depth_mode=None, conf_mode=None, desc_dim=None, 
+               desc_mode='norm', two_confs=False, desc_conf_mode=None):
     if desc_conf_mode is None:
         desc_conf_mode = conf_mode
     fmap = out.permute(0, 2, 3, 1)  # B,H,W,D
-    res = dict(pts3d=reg_dense_depth(fmap[..., 0:3], mode=depth_mode))
+    res = {}
+    offset = 0
+    if depth_mode is not None:
+        res['pts3d'] = reg_dense_depth(fmap[..., 0:3], mode=depth_mode)
+        offset += 3
     if conf_mode is not None:
-        res['conf'] = reg_dense_conf(fmap[..., 3], mode=conf_mode)
+        res['conf'] = reg_dense_conf(fmap[..., offset], mode=conf_mode)
+        offset += 1
     if desc_dim is not None:
-        start = 3 + int(conf_mode is not None)
-        res['desc'] = reg_desc(fmap[..., start:start + desc_dim], mode=desc_mode)
+        res['desc'] = reg_desc(fmap[..., offset:offset + desc_dim], mode=desc_mode)
         if two_confs:
-            res['desc_conf'] = reg_dense_conf(fmap[..., start + desc_dim], mode=desc_conf_mode)
-        else:
+            if desc_conf_mode is None:
+                desc_conf_mode = conf_mode
+            res['desc_conf'] = reg_dense_conf(fmap[..., offset + desc_dim], mode=desc_conf_mode)
+        elif 'conf' in res:
             res['desc_conf'] = res['conf'].clone()
     return res
 
@@ -1092,6 +1153,16 @@ def mast3r_head_factory(head_type, output_mode, net, has_conf=False):
                                                postprocess=postprocess,
                                                depth_mode=net.conf.depth_mode,
                                                conf_mode=net.conf.conf_mode,
+                                               head_type='regression')
+    elif head_type == 'mlp' and output_mode.startswith('desc'):
+        local_feat_dim = int(output_mode[4:])
+        assert net.conf.dec_depth > 9
+        feature_dim = 256
+        last_dim = feature_dim // 2
+        return MLP_LocalFeatures(net, local_feat_dim=local_feat_dim, has_conf=has_conf,
+                                               feature_dim=feature_dim,
+                                               last_dim=last_dim,
+                                               postprocess=postprocess,
                                                head_type='regression')
     else:
         raise NotImplementedError(
@@ -1333,6 +1404,9 @@ class MASt3R(BaseModel):
             state_dict = torch.load(conf.weights, map_location="cpu")
         else:
             state_dict = torch.hub.load_state_dict_from_url(self.checkpoint_url, map_location="cpu")['model']
+        if not conf.output_mode.startswith('pts3d'):
+            pattern = 'downstream_head1.dpt.', 'downstream_head2.dpt.'
+            state_dict = {k: v for k, v in state_dict.items() if not k.startswith(pattern)}
         self.load_state_dict(state_dict)
         # self.load_state_dict(state_dict, strict=False) # mast3r
 
@@ -1431,7 +1505,7 @@ class MASt3R(BaseModel):
             **pred1,
         }
 
-        if self.conf.points_outputs:
+        if self.conf.points_outputs and self.conf.output_mode.startswith('pts3d'):
             pred0 = {
                 "pointcloud": res0['pts3d'],
                 "pointcloud_scores": res0['conf'],

@@ -27,6 +27,8 @@ model:
         tiling_keypoints: False
         confidence_threshold: 0
         trainable: False
+        head_type: mlp
+        output_mode: desc24
     ground_truth:
         name: matchers.homography_matcher
         th_positive: 3
