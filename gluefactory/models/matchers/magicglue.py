@@ -535,7 +535,7 @@ class LightGlue(nn.Module):
             for i in range(self.conf.n_layers):
                 if self.conf.checkpointed and self.training:
                     desc0, desc1 = checkpoint(
-                        self.transformers[i], desc0, desc1, encoding0, encoding1
+                        self.transformers[i], desc0, desc1, encoding0, encoding1, use_reentrant=False
                     )
                 else:
                     desc0, desc1 = self.transformers[i](desc0, desc1, encoding0, encoding1)
