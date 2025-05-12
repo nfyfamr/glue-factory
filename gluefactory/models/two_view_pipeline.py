@@ -17,6 +17,9 @@ from .base_model import BaseModel
 
 to_ctr = OmegaConf.to_container  # convert DictConfig to dict
 
+def recursive_prefix(original_dict, prefix="gt_"):
+    return {f"{prefix}{k}": recursive_prefix(v, prefix) if isinstance(v, dict) else v 
+            for k, v in original_dict.items()}
 
 class TwoViewPipeline(BaseModel):
     default_conf = {
@@ -104,7 +107,7 @@ class TwoViewPipeline(BaseModel):
 
         if self.conf.ground_truth.name and self.conf.run_gt_in_forward:
             gt_pred = self.ground_truth({**data, **pred})
-            pred.update({f"gt_{k}": v for k, v in gt_pred.items()})
+            pred.update(recursive_prefix(gt_pred))
         return pred
 
     def loss(self, pred, data):
@@ -115,7 +118,7 @@ class TwoViewPipeline(BaseModel):
         # get labels
         if self.conf.ground_truth.name and not self.conf.run_gt_in_forward:
             gt_pred = self.ground_truth({**data, **pred})
-            pred.update({f"gt_{k}": v for k, v in gt_pred.items()})
+            pred.update(recursive_prefix(gt_pred))
 
         for k in self.components:
             apply = True
