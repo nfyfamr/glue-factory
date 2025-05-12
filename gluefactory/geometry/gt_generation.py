@@ -161,6 +161,78 @@ def gt_matches_from_homography(kp0, kp1, H, pos_th=3, neg_th=6, **kw):
     }
 
 
+@torch.no_grad()
+def gt_warp_from_pose_depth(
+    kp0, kp1, data, pos_th=3, neg_th=5, epi_th=None, cc_th=None, **kw
+):
+    if kp0.shape[1] == 0 or kp1.shape[1] == 0:
+        b_size, n_kp0 = kp0.shape[:2]
+        n_kp1 = kp1.shape[1]
+        assignment = torch.zeros(
+            b_size, n_kp0, n_kp1, dtype=torch.bool, device=kp0.device
+        )
+        m0 = -torch.ones_like(kp0[:, :, 0]).long()
+        m1 = -torch.ones_like(kp1[:, :, 0]).long()
+        return assignment, m0, m1
+    camera0, camera1 = data["view0"]["camera"], data["view1"]["camera"]
+    T_0to1, T_1to0 = data["T_0to1"], data["T_1to0"]
+
+    depth0 = data["view0"].get("depth")
+    depth1 = data["view1"].get("depth")
+    if "depth_keypoints0" in kw and "depth_keypoints1" in kw:
+        d0, valid0 = kw["depth_keypoints0"], kw["valid_depth_keypoints0"]
+        d1, valid1 = kw["depth_keypoints1"], kw["valid_depth_keypoints1"]
+    else:
+        assert depth0 is not None
+        assert depth1 is not None
+        d0, valid0 = sample_depth(kp0, depth0)
+        d1, valid1 = sample_depth(kp1, depth1)
+
+    kp0_1, visible0 = project(
+        kp0, d0, depth1, camera0, camera1, T_0to1, valid0, ccth=cc_th
+    )
+    kp1_0, visible1 = project(
+        kp1, d1, depth0, camera1, camera0, T_1to0, valid1, ccth=cc_th
+    )
+    mask_visible = visible0.unsqueeze(-1) & visible1.unsqueeze(-2)
+    covisible_mask = mask_visible
+
+    F = (
+        camera1.calibration_matrix().inverse().transpose(-1, -2)
+        @ T_to_E(T_0to1)
+        @ camera0.calibration_matrix().inverse()
+    )
+    epi_dist = sym_epipolar_distance_all(kp0, kp1, F)
+
+    # Add some more unmatched points using epipolar geometry
+    if epi_th is not None:
+        mask_ignore = (m0.unsqueeze(-1) == ignore) & (m1.unsqueeze(-2) == ignore)
+        epi_dist = torch.where(mask_ignore, epi_dist, inf)
+        exclude0 = epi_dist.min(-1).values > neg_th
+        exclude1 = epi_dist.min(-2).values > neg_th
+        m0 = torch.where((~valid0) & exclude0, ignore.new_tensor(-1), m0)
+        m1 = torch.where((~valid1) & exclude1, ignore.new_tensor(-1), m1)
+
+    return kp0_1, covisible_mask.float()
+
+
+@torch.no_grad()
+def gt_warp_from_homography(kp0, im_size, H, inverse=False, **kw):
+    assert kp0.shape[1] > 0
+    kp0_1 = warp_points_torch(kp0, H, inverse=inverse)
+
+    # Covisible
+    h, w = im_size
+    covisible_mask = (
+        (kp0_1[:, :, 0] > 0)
+        * (kp0_1[:, :, 0] < w - 1)
+        * (kp0_1[:, :, 1] > 0)
+        * (kp0_1[:, :, 1] < h - 1)
+    )
+
+    return kp0_1, covisible_mask.float()
+
+
 def sample_pts(lines, npts):
     dir_vec = (lines[..., 2:4] - lines[..., :2]) / (npts - 1)
     pts = lines[..., :2, np.newaxis] + dir_vec[..., np.newaxis].expand(

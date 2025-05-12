@@ -34,6 +34,67 @@ def normalize_keypoints(
     return kpts
 
 
+@dynamic_custom_fwd(cast_inputs=torch.float32)
+def denormalize_keypoints(
+    kpts: torch.Tensor, size: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    if size is None:
+        raise ValueError("Size must be provided to denormalize keypoints.")
+    elif not isinstance(size, torch.Tensor):
+        size = torch.tensor(size, device=kpts.device, dtype=kpts.dtype)
+    size = size.to(kpts)
+    shift = size / 2
+    scale = size.max(-1).values / 2
+    kpts = kpts * scale[..., None, None] + shift[..., None, :]
+    return kpts
+
+
+@dynamic_custom_fwd(cast_inputs=torch.float32)
+def get_normalization_T(size: torch.Tensor) -> torch.Tensor:
+    if not isinstance(size, torch.Tensor):
+        size = torch.tensor(size, device=kpts.device, dtype=kpts.dtype)
+    assert size[0:1].allclose(size), "Size must be all identical"
+    w, h = size[0]
+    norm_T = torch.tensor([
+        [2 / (w-1), 0, -1],
+        [0, 2 / (h-1), -1],
+        [0, 0, 1]
+    ], device=size.device)
+    return norm_T
+
+
+@dynamic_custom_fwd(cast_inputs=torch.float32)
+def normalize_keypoints2(
+    kpts: torch.Tensor, size: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    if size is None:
+        raise ValueError("Size must be provided to normalize keypoints.")
+    elif not isinstance(size, torch.Tensor):
+        size = torch.tensor(size, device=kpts.device, dtype=kpts.dtype)
+    assert size[0:1].allclose(size), "Size must be all identical"
+    size = size.to(kpts)
+    shift = ((size - 1) / 2).unsqueeze(1)
+    scale = ((size - 1) / 2).unsqueeze(1)
+    kpts = (kpts - shift) / scale
+    return kpts
+
+
+@dynamic_custom_fwd(cast_inputs=torch.float32)
+def denormalize_keypoints2(
+    kpts: torch.Tensor, size: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    if size is None:
+        raise ValueError("Size must be provided to denormalize keypoints.")
+    elif not isinstance(size, torch.Tensor):
+        size = torch.tensor(size, device=kpts.device, dtype=kpts.dtype)
+    assert size[0:1].allclose(size), "Size must be all identical"
+    size = size.to(kpts)
+    shift = ((size - 1) / 2).unsqueeze(1)
+    scale = ((size - 1) / 2).unsqueeze(1)
+    kpts = kpts * scale + shift
+    return kpts
+
+
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x = x.unflatten(-1, (-1, 2))
     x1, x2 = x.unbind(dim=-1)
@@ -305,49 +366,80 @@ def filter_matches(scores: torch.Tensor, th: float):
 
 
 class KeyCorrection(nn.Module):
-    def __init__(self, input_dim=256, hidden_dim=256, output_dim=2, bn_momentum = 0.01):
+    def __init__(self, input_dim=24, hidden_dim=512, output_dim=3, bn_momentum=0.01):
         super().__init__()
         relu = nn.ReLU(inplace=True)
-        leaky_relu = nn.LeakyReLU(negative_slope=0.1)
-        self.encoder = nn.Sequential(
-            nn.Conv2d(input_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.LayerNorm([hidden_dim, 16, 16]),
-            # nn.BatchNorm2d(hidden_dim, momentum = bn_momentum),
+        self.pool = nn.MaxPool2d(2)
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(input_dim*2, 64, kernel_size=3, padding=1),  # 48, 64
+            nn.BatchNorm2d(64),
             relu,
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.LayerNorm([hidden_dim, 16, 16]),
-            # nn.BatchNorm2d(hidden_dim, momentum = bn_momentum),
-            relu,
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.LayerNorm([hidden_dim, 16, 16]),
-            # nn.BatchNorm2d(hidden_dim, momentum = bn_momentum),
-            relu,
-            nn.AdaptiveAvgPool2d(1)
         )
-        self.correction_head = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim//2, kernel_size=1),
-            leaky_relu,
-            nn.Conv2d(hidden_dim//2, output_dim, kernel_size=1),
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),  # 64, 128
+            nn.BatchNorm2d(128),
+            relu,
         )
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),  # 128, 256
+            nn.BatchNorm2d(256),
+            relu,
+        )
+        self.up1 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)  # 4x4 -> 8x8
+        self.dec1 = nn.Sequential(
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),  # 256, 128
+            nn.BatchNorm2d(128),
+            relu,
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+        )
+        self.up2 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)  # 8x8 -> 16x16
+        self.dec2 = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),  # 128, 64
+            nn.BatchNorm2d(64),
+            relu,
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+        )
+        self.head = nn.Conv2d(64, output_dim, kernel_size=1)
 
-    def forward(self, x):
-        """
-        Input: x (b, n, p, p, d)
-        Output: keypoint shifts (b, n, 2)
-        """
-        b, n, p, _, d = x.shape
-        x = x.permute(0, 1, 4, 2, 3).reshape(b*n, d, p, p)  # (b*n, d, p, p)
-        x = self.encoder(x)  # (b*n, d, 1, 1)
-        shift = self.correction_head(x).view(b, n, -1)
-        return shift
+    def forward(self, feat0, feat1, m0):
+        feat0 = feat0.permute(0, 2, 3, 4, 1)  # (b, d, m, p, p) -> (b, m, p, p, d)
+        feat1 = feat1.permute(0, 2, 3, 4, 1)
+        b, m, p, _, d = feat0.shape
+        
+        feat1 = feat1[torch.arange(b)[:, None], m0, ...]
+        f = torch.cat([feat0, feat1], dim=-1)  # (b, m, p, p, 2*d)
+        f = f.permute(0, 1, 4, 2, 3).view(b*m, 2*d, p, p)
+
+        e1 = self.enc1(f)  # (bm, 64, 16, 16)
+        e2 = self.pool(e1)  # (bm, 64, 8, 8)
+
+        e2 = self.enc2(e2)  # (bm, 128, 8, 8)
+        e3 = self.pool(e2)  # (bm, 128, 4, 4)
+
+        e3 = self.enc3(e3)  # (bm, 256, 4, 4)
+        
+        d1 = self.up1(e3)  # (bm, 128, 8, 8)
+        d1 = torch.cat([d1, e2], dim=1)  # (bm, 128+128, 8, 8)
+        d1 = self.dec1(d1)  # (bm, 128, 8, 8)
+        
+        d2 = self.up2(d1)  # (bm, 64, 16, 16)
+        d2 = torch.cat([d2, e1], dim=1)  # (bm, 64+64, 16, 16)
+        d2 = self.dec2(d2)  # (bm, 64, 16, 16)
+        
+        out = self.head(d2)  # (bm, 3, 16, 16)
+        out = out.view(b, m, 3, p, p).permute(0, 1, 3, 4, 2)  # (b, m, p, p, 3)
+        offset, conf = out[..., :2], out[..., 2]
+        return offset, conf
 
 
-class LightGlue(nn.Module):
+class MagicGlue(nn.Module):
     default_conf = {
-        "name": "lightglue",  # just for interfacing
+        "name": "magicglue",  # just for interfacing
         "input_dim": 256,  # input descriptor dimension (autoselected from weights)
+        "input_coarse_dim": 256,
         "add_scale_ori": False,
         "descriptor_dim": 256,
+        "patch_size": 16,
         "n_blocks": 1,
         "n_layers": 9,
         "num_heads": 4,
@@ -364,27 +456,34 @@ class LightGlue(nn.Module):
             "gamma": 1.0,
             "fn": "nll",
             "nll_balancing": 0.5,
+            "refine_conf_weight": 0.01,
         },
     }
 
     required_data_keys = ["keypoints0", "keypoints1", "descriptors0", "descriptors1", "dense_descriptors0", "dense_descriptors1"]
 
-    url = "https://github.com/cvg/LightGlue/releases/download/{}/{}_lightglue.pth"
+    url = "magicglue.pth"
 
     def __init__(self, conf) -> None:
         super().__init__()
         self.conf = conf = OmegaConf.merge(self.default_conf, conf)
 
-        self.key_corretion = KeyCorrection(conf.input_dim)
-
         if conf.input_dim != conf.descriptor_dim:
-            self.input_proj = nn.Linear(conf.input_dim, conf.descriptor_dim, bias=True)
+            self.input_proj = nn.ModuleList(
+                [
+                    nn.Linear(conf.input_dim, conf.descriptor_dim, bias=True)
+                    for _ in range(conf.n_blocks)
+                ]
+            )
         else:
-            self.input_proj = nn.Identity()
+            self.input_proj = nn.ModuleList([nn.Identity() for _ in range(conf.n_blocks)])
 
         head_dim = conf.descriptor_dim // conf.num_heads
-        self.posenc = LearnableFourierPositionalEncoding(
-            2 + 2 * conf.add_scale_ori, head_dim, head_dim
+        self.posenc = nn.ModuleList(
+            [
+                LearnableFourierPositionalEncoding(2 + 2 * conf.add_scale_ori, head_dim, head_dim)
+                for _ in range(conf.n_blocks)
+            ]
         )
 
         h, n, d = conf.num_heads, conf.n_layers, conf.descriptor_dim
@@ -393,16 +492,18 @@ class LightGlue(nn.Module):
             [TransformerLayer(d, h, conf.flash) for _ in range(n)]
         )
 
-        self.log_assignment = nn.ModuleList([MatchAssignment(d) for _ in range(n)])
-        self.token_confidence = nn.ModuleList(
-            [TokenConfidence(d) for _ in range(n - 1)]
-        )
+        self.init_log_assignment = MatchAssignment(conf.input_dim + conf.input_coarse_dim)
+        self.key_corretion = nn.ModuleList([KeyCorrection(conf.input_dim) for _ in range(conf.n_blocks)])
+        self.log_assignment = nn.ModuleList([MatchAssignment(d) for _ in range(conf.n_blocks)])
+        # self.token_confidence = nn.ModuleList(
+        #     [TokenConfidence(d) for _ in range(n - 1)]
+        # )
 
         self.loss_fn = NLLLoss(conf.loss)
 
         state_dict = None
         if conf.weights is not None:
-            # weights can be either a path or an existing file from official LG
+            # weights can be either a path or an existing file from official MagicGlue
             if Path(conf.weights).exists():
                 state_dict = torch.load(conf.weights, map_location="cpu")
             elif (Path(DATA_PATH) / conf.weights).exists():
@@ -410,14 +511,15 @@ class LightGlue(nn.Module):
                     str(DATA_PATH / conf.weights), map_location="cpu"
                 )
             else:
-                fname = (
-                    f"{conf.weights}_{conf.weights_from_version}".replace(".", "-")
-                    + ".pth"
-                )
-                state_dict = torch.hub.load_state_dict_from_url(
-                    self.url.format(conf.weights_from_version, conf.weights),
-                    file_name=fname,
-                )
+                raise NotImplementedError("weights not found")
+                # fname = (
+                #     f"{conf.weights}_{conf.weights_from_version}".replace(".", "-")
+                #     + ".pth"
+                # )
+                # state_dict = torch.hub.load_state_dict_from_url(
+                #     self.url.format(conf.weights_from_version, conf.weights),
+                #     file_name=fname,
+                # )
 
         if state_dict:
             # rename old state dict entries
@@ -451,8 +553,8 @@ class LightGlue(nn.Module):
         if "view0" in data.keys() and "view1" in data.keys():
             size0 = data["view0"].get("image_size")
             size1 = data["view1"].get("image_size")
-        kpts0 = normalize_keypoints(kpts0, size0).clone()
-        kpts1 = normalize_keypoints(kpts1, size1).clone()
+        kpts0 = normalize_keypoints2(kpts0, size0).clone()
+        kpts1 = normalize_keypoints2(kpts1, size1).clone()
 
         if self.conf.add_scale_ori:
             sc0, o0 = data["scales0"], data["oris0"]
@@ -477,52 +579,115 @@ class LightGlue(nn.Module):
         desc0 = data["descriptors0"].contiguous()
         desc1 = data["descriptors1"].contiguous()
 
-        assert desc0.shape[-1] == self.conf.input_dim
-        assert desc1.shape[-1] == self.conf.input_dim
+        # combine features: fine(24) + coarse(1792)
+        if "coarse_descriptors0" in data.keys() and "coarse_descriptors1" in data.keys():
+            patch_size = self.conf.patch_size
+            _, cd, ch0, cw0 = data["coarse_descriptors0"].shape  # d: 1024+768
+            _, cd, ch1, cw1 = data["coarse_descriptors1"].shape
+
+            coarse_desc0 = data["coarse_descriptors0"].flatten(2)
+            coarse_desc1 = data["coarse_descriptors1"].flatten(2)
+
+            kpts_coarse0 = (data["keypoints0"] // patch_size).long()
+            kpts_coarse1 = (data["keypoints1"] // patch_size).long()
+            kpts_coarse0_flat = kpts_coarse0[..., 1] * cw0 + kpts_coarse0[..., 0]  # (b, m)
+            kpts_coarse1_flat = kpts_coarse1[..., 1] * cw1 + kpts_coarse1[..., 0]
+
+            coarse_desc0 = torch.gather(coarse_desc0, 2, kpts_coarse0_flat.unsqueeze(1).expand(-1, cd, -1))  # (b, cd, m)
+            coarse_desc1 = torch.gather(coarse_desc1, 2, kpts_coarse1_flat.unsqueeze(1).expand(-1, cd, -1))
+            coarse_desc0 = coarse_desc0.transpose(1, 2)  # (b, m, cd)
+            coarse_desc1 = coarse_desc1.transpose(1, 2)
+
+            desc0 = torch.cat([desc0, coarse_desc0], dim=2)  # (b, m, xd)
+            desc1 = torch.cat([desc1, coarse_desc1], dim=2)
+
+        assert desc0.shape[-1] == (self.conf.input_dim + self.conf.input_coarse_dim)
+        assert desc1.shape[-1] == (self.conf.input_dim + self.conf.input_coarse_dim)
         if torch.is_autocast_enabled():
             desc0 = desc0.half()
             desc1 = desc1.half()
 
-        for i in range(self.conf.n_blocks):
-            # Input: x (b, n, p, p, d)
-            # Output: keypoint shifts (b, n, 2)
-            # TODO: check descriptor dimension first, if it doesn't meet requirement, then fall back to dense descriptors, otherwise throw an error.
-            shift0 = self.compute_key_shift(kpts0, data["dense_descriptors0"], size0)
-            shift1 = self.compute_key_shift(kpts1, data["dense_descriptors1"], size1)
+        # Initial matching
+        scores, sims = self.init_log_assignment(desc0, desc1)
+        m0, m1, mscores0, mscores1 = filter_matches(scores, self.conf.filter_threshold)
+        init_scores = scores.clone()
+        init_sims = sims.clone()
+        init_kpts0 = kpts0.clone()
+        init_kpts1 = kpts1.clone()
+        init_m0 = m0.clone()
 
-            kpts0 = kpts0 + shift0
-            kpts1 = kpts1 + shift1
+        all_ksamples0, all_ksamples1 = [], []
+        all_flow_patch, all_flow_patch_prob = [], []
+        all_valid_mask0, all_valid_mask1 = [], []
+        all_desc0, all_desc1 = [], []
+
+        do_point_pruning = False
+        do_early_stop = False
+        # During inference, run the rest modules only with valid matches.
+        # During training, run the rest modules with valid masking.
+        for blk in range(self.conf.n_blocks):
+            valid_mask0 = (m0 > -1)
+            valid_mask1 = torch.zeros_like(m1, dtype=torch.bool)
+            rows, cols = valid_mask0.nonzero(as_tuple=True)
+            valid_mask1[rows, m0[rows, cols]] = True
+            all_valid_mask0.append(valid_mask0)
+            all_valid_mask1.append(valid_mask1)
+
+            if not self.training:
+                if (m0 == -1).all():
+                    break
+                
+                # TODO: Reduce inference time workload
+                # valid_indices0 = valid_mask0.nonzero(as_tuple=True)[0]
+                # valid_indices1 = valid_mask1.nonzero(as_tuple=True)[0]
+                # valid_mask0 = valid_mask0[valid_indices0]
+                # valid_mask1 = valid_mask1[valid_indices1]
+                # kpts0, kpts1 = kpts0[valid_indices0], kpts1[valid_indices1]
+
+            # Keypoint correction
+            # TODO: The current assumption is the two image sizes are the same, when calcuating coordinates.
+            assert (size0[0] == size1[0]).all()
+            feat_crops0, kpts_smaples0 = self.crop_feature(kpts0, data["dense_descriptors0"], size0)  # (b, d, m, p, p), (b, m, p, p, 2)
+            feat_crops1, kpts_smaples1 = self.crop_feature(kpts1, data["dense_descriptors1"], size1)
+
+            flow_patch0to1, flow_patch_prob = self.key_corretion[blk](feat_crops0, feat_crops1, m0)  # (b, m, p, p, 2), (b, m, p, p)
+            all_ksamples0.append(kpts_smaples0)
+            all_ksamples1.append(kpts_smaples1)
+            all_flow_patch.append(flow_patch0to1)
+            all_flow_patch_prob.append(flow_patch_prob)
+
+            shift0, shift1 = self.get_key_shifts(flow_patch0to1.detach(), flow_patch_prob.detach(), size1)
+            kpts0[valid_mask0] = (kpts0 + shift0)[valid_mask0]
+            kpts1[torch.arange(b)[:, None], m0, ...][valid_mask0] = (kpts1[torch.arange(b)[:, None], m0, ...] + shift1)[valid_mask0]
 
             desc0 = F.grid_sample(
                 data["dense_descriptors0"].permute(0, 3, 1, 2),  # (b, d, h, w)
-                kpts0.reshape(b, m, 1, 2),  # (b, m, 1, 2)
+                kpts0.unsqueeze(2),  # (b, m, 1, 2)
                 mode=self.conf.key_sample_mode,
                 padding_mode="zeros",
-                align_corners=False,
+                align_corners=True,
             ).squeeze(-1).permute(0, 2, 1)  # (b, m, d)
             desc1 = F.grid_sample(
                 data["dense_descriptors1"].permute(0, 3, 1, 2),  # (b, d, h, w)
-                kpts1.reshape(b, n, 1, 2),  # (b, n, 1, 2)
+                kpts1.unsqueeze(2),  # (b, n, 1, 2)
                 mode=self.conf.key_sample_mode,
                 padding_mode="zeros",
-                align_corners=False,
-            ).squeeze(-1).permute(0, 2, 1)  # (b, m, d)
+                align_corners=True,
+            ).squeeze(-1).permute(0, 2, 1)  # (b, n, d)
 
-            ############################################
-            # light glue logic
-            desc0 = self.input_proj(desc0)
-            desc1 = self.input_proj(desc1)
+            # Fine matching
+            desc0 = self.input_proj[blk](desc0)
+            desc1 = self.input_proj[blk](desc1)
             # cache positional embeddings
-            encoding0 = self.posenc(kpts0)
-            encoding1 = self.posenc(kpts1)
+            encoding0 = self.posenc[blk](kpts0)
+            encoding1 = self.posenc[blk](kpts1)
 
             # GNN + final_proj + assignment
-            do_early_stop = self.conf.depth_confidence > 0 and not self.training
+            # do_early_stop = self.conf.depth_confidence > 0 and not self.training
             # do_point_pruning = self.conf.width_confidence > 0 and not self.training
-            # TODO: handle point pruning
-            do_point_pruning = False
-
-            all_desc0, all_desc1 = [], []
+            # TODO: handle point pruning and early stopping
+            # do_point_pruning = False
+            # do_early_stop = False
 
             # do not prune
             # if do_point_pruning:
@@ -539,18 +704,18 @@ class LightGlue(nn.Module):
                     )
                 else:
                     desc0, desc1 = self.transformers[i](desc0, desc1, encoding0, encoding1)
-                if self.training or i == self.conf.n_layers - 1:
-                    all_desc0.append(desc0)
-                    all_desc1.append(desc1)
-                    continue  # no early stopping or adaptive width at last layer
+                # if self.training or i == self.conf.n_layers - 1:
+            all_desc0.append(desc0)
+            all_desc1.append(desc1)
+                # continue  # no early stopping or adaptive width at last layer
 
             # only for eval
             # we conduct early stopping and point pruning at each end of blocks.
-            if do_early_stop:
-                assert b == 1
-                token0, token1 = self.token_confidence[i](desc0, desc1)
-                if self.check_if_stop(token0[..., :m, :], token1[..., :n, :], i, m + n):
-                    break
+            # if do_early_stop:
+            #     assert b == 1
+            #     token0, token1 = self.token_confidence[i](desc0, desc1)
+            #     if self.check_if_stop(token0[..., :m, :], token1[..., :n, :], i, m + n):
+            #         break
             # if do_point_pruning:
             #     assert b == 1
             #     scores0 = self.log_assignment[i].get_matchability(desc0)
@@ -568,9 +733,9 @@ class LightGlue(nn.Module):
             #     encoding1 = encoding1.index_select(-2, keep1)
             #     prune1[:, ind1] += 1
 
-        desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]
-        scores, _ = self.log_assignment[i](desc0, desc1)
-        m0, m1, mscores0, mscores1 = filter_matches(scores, self.conf.filter_threshold)
+            desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]
+            scores, _ = self.log_assignment[blk](desc0, desc1)
+            m0, m1, mscores0, mscores1 = filter_matches(scores, self.conf.filter_threshold)
 
         if do_point_pruning:
             m0_ = torch.full((b, m), -1, device=m0.device, dtype=m0.dtype)
@@ -587,12 +752,24 @@ class LightGlue(nn.Module):
             prune1 = torch.ones_like(mscores1) * self.conf.n_layers
 
         pred = {
+            "keypoints0": denormalize_keypoints2(kpts0, size0),
+            "keypoints1": denormalize_keypoints2(kpts1, size1),
             "matches0": m0,
             "matches1": m1,
             "matching_scores0": mscores0,
             "matching_scores1": mscores1,
-            "ref_descriptors0": torch.stack(all_desc0, 1),
-            "ref_descriptors1": torch.stack(all_desc1, 1),
+            "init_keypoints0": denormalize_keypoints2(init_kpts0, size0),
+            "init_keypoints1": denormalize_keypoints2(init_kpts1, size1),
+            "init_matches0": init_m0,
+            "init_log_assignment": init_scores,
+            "valid_mask0": torch.stack(all_valid_mask0, 1),
+            "valid_mask1": torch.stack(all_valid_mask1, 1),
+            "intermediate_ksamples0": denormalize_keypoints2(torch.stack(all_ksamples0, 1).view(b, -1, 2), size0) if len(all_ksamples0) > 0 else None,
+            "intermediate_ksamples1": denormalize_keypoints2(torch.stack(all_ksamples1, 1).view(b, -1, 2), size1) if len(all_ksamples1) > 0 else None,
+            "intermediate_flow": torch.stack(all_flow_patch, 1).view(b, -1, 2) if len(all_flow_patch) > 0 else None,
+            "intermediate_flow_conf": torch.stack(all_flow_patch_prob, 1).view(b, -1) if len(all_flow_patch_prob) > 0 else None,
+            "ref_descriptors0": torch.stack(all_desc0, 1) if len(all_desc0) > 0 else None,
+            "ref_descriptors1": torch.stack(all_desc1, 1) if len(all_desc1) > 0 else None,
             "log_assignment": scores,
             "prune0": prune0,
             "prune1": prune1,
@@ -600,45 +777,75 @@ class LightGlue(nn.Module):
 
         return pred
 
-    def compute_key_shift(self, kpts, desc, size: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def crop_feature(self, kpts, desc, size: Optional[torch.Tensor] = None) -> torch.Tensor:
         b, n, _ = kpts.shape
-        _, _, _, d = desc.shape
+        _, h, w, d = desc.shape
 
         if size is None:
             size = 1 + kpts.max(-2).values - kpts.min(-2).values
         elif not isinstance(size, torch.Tensor):
             size = torch.tensor(size, device=kpts.device, dtype=kpts.dtype)
         size = size.to(kpts)
-        # TODO: make patch_size as a hyperparameter
-        patch_size = 16
+
+        patch_size = self.conf.patch_size
         half_patch = patch_size // 2
         patch_grid = torch.meshgrid(
             torch.linspace(-half_patch, half_patch, patch_size, device=kpts.device),
             torch.linspace(-half_patch, half_patch, patch_size, device=kpts.device),
             indexing='xy'
         )
-        patch_grid = torch.stack(patch_grid, dim=-1)  # (patch_size, patch_size, 2)
+        patch_grid = torch.stack(patch_grid, dim=-1)  # (p, p, 2)
         
         # Normalize grid displacements to feature map scale
         patch_grid = patch_grid.expand(b, n, -1, -1, -1)  # (p, p, 2) -> (b, n, p, p, 2)
-        patch_grid = patch_grid * 2.0 / size.max(-1).values.view(b, 1, 1, 1, 1)
+        patch_grid = patch_grid * 2.0 / size[:, None, None, None, :]
         
         # Add keypoint centers to grid
-        sampling_grid = patch_grid + kpts.unsqueeze(2).unsqueeze(2)  # (b, n, patch_size, patch_size, 2)
+        sampling_grid = patch_grid + kpts.unsqueeze(2).unsqueeze(2)  # (b, n, p, p, 2)
+        sampling_grid = sampling_grid.view(b, n*patch_size*patch_size, 1, 2)  # (b, n*p*p, 1, 2)
         
-        patches = torch.zeros(b, n, patch_size, patch_size, d, device=kpts.device)
+        patches = torch.zeros(b, d, n, patch_size, patch_size, device=kpts.device)  # (b, d, n, p, p)
+        desc = desc.permute(0, 3, 1, 2)  # (b, d, h, w)
         for i in range(b):
             batch_patches = F.grid_sample(
-                desc[i].permute(2, 0, 1).unsqueeze(0),  # (1, d, h, w)
-                sampling_grid[i].reshape(1, n*patch_size*patch_size, 1, 2),  # (1, n*patch_size*patch_size, 1, 2)
+                desc[i].unsqueeze(0),  # (1, d, h, w)
+                sampling_grid[i].unsqueeze(0),  # (1, n*p*p, 1, 2)
                 mode=self.conf.key_sample_mode,
                 padding_mode="zeros",
-                align_corners=False,
+                align_corners=True,
             )  # (1, d, n*patch_size*patch_size, 1)
-            patches[i] = batch_patches.view(d, n, patch_size, patch_size).permute(1, 2, 3, 0)  # (b, n, p, p, d)
+            patches[i] = batch_patches.view(d, n, patch_size, patch_size)
+        return patches, sampling_grid.view(b, n, patch_size, patch_size, 2)
 
-        shift = self.key_corretion(patches)  # (b, n, 2)
-        return shift
+    def get_key_shifts(self, flow_patch0to1, flow_patch_prob, size) -> torch.Tensor:
+        b, m, p, _ = flow_patch_prob.shape
+        flow_patch_prob_flat = flow_patch_prob.view(b, m, -1)  # (b, m, p*p)
+        max_idx = flow_patch_prob_flat.argmax(dim=2)  # (b, m)
+        h_idx = max_idx // p   # row index
+        w_idx = max_idx % p    # col index
+        batch_idx = torch.arange(b).unsqueeze(1).expand(b, m)  # (b, m)
+        n_idx = torch.arange(m).unsqueeze(0).expand(b, m)      # (b, m)
+
+        size = size.to(flow_patch0to1)
+
+        # patch_size = self.conf.patch_size
+        half_patch = p // 2
+        patch_grid = torch.meshgrid(
+            torch.linspace(-half_patch, half_patch, p, device=flow_patch0to1.device),
+            torch.linspace(-half_patch, half_patch, p, device=flow_patch0to1.device),
+            indexing='xy'
+        )
+        patch_grid = torch.stack(patch_grid, dim=-1)  # (p, p, 2)
+        
+        # Normalize grid displacements to feature map scale
+        patch_grid = patch_grid.expand(b, m, -1, -1, -1)  # (p, p, 2) -> (b, m, p, p, 2)
+        patch_grid = patch_grid * 2.0 / size[:, None, None, None, :]
+        
+        # shift0 = patch_grid
+        # shift1 = patch_grid + flow_patch0to1
+        shift0 = patch_grid[batch_idx, n_idx, h_idx, w_idx]  # (b, m, 2)
+        shift1 = shift0 + flow_patch0to1[batch_idx, n_idx, h_idx, w_idx]  # (b, m, p, p, 2)
+        return shift0, shift1
         
     def confidence_threshold(self, layer_index: int) -> float:
         """scaled confidence threshold"""
@@ -682,40 +889,105 @@ class LightGlue(nn.Module):
                 "log_assignment": la,
             }
 
-        sum_weights = 1.0
-        nll, gt_weights, loss_metrics = self.loss_fn(loss_params(pred, -1), data)
-        N = pred["ref_descriptors0"].shape[1]
-        losses = {"total": nll, "last": nll.clone().detach(), **loss_metrics}
+        device = pred["init_log_assignment"].device
 
-        if self.training:
-            losses["confidence"] = 0.0
+        zero = pred["init_log_assignment"].new_tensor([0])
+        nll_init, loss_refine, loss_light = zero.clone(), zero.clone(), zero.clone()
+        
+        nll_init, _, loss_metrics_init = self.loss_fn({"log_assignment": pred["init_log_assignment"]}, data["gt_init"])
+        loss_metrics_init = {f"{k}_init": v for k, v in loss_metrics_init.items()}
+        
+        # Regression loss
+        def get_refine_loss(pred, data, i):
+            b, blk_k, _ = pred["intermediate_flow"].shape  # k = m*p*p
+            _, m = pred["init_matches0"].shape
+            blk = self.conf.n_blocks
+            k = blk_k // blk
+            pp = k // m
+            m0 = pred["init_matches0"]  # (b, m)
+            patch_warps0_1 = pred["intermediate_ksamples1"].view(b, blk, m, pp, 2)[:, i]  # (b, m, pp, 2)
+            patch_warps0_1 = (patch_warps0_1[torch.arange(b)[:, None], m0, ...]).view(b, -1, 2)  # (b, k, 2)
+            patch_warps0_1 = pred["intermediate_flow"].view(b, blk, k, 2)[:, i] + normalize_keypoints2(patch_warps0_1, data["view0"].get("image_size"))  # (b, k, 2)
+            # TODO: in float16 mode, the generated data["gt_patch_warps0_1"] contains inf values due to range of float16.
+            # Need to handle this case, possibly by generate it in normalized coordinates.
+            epe = (patch_warps0_1 - normalize_keypoints2(data["gt_patch_warps0_1"].view(b, blk, k, 2)[:, i], data["view1"].get("image_size"))).norm(dim=-1)
+            x = epe * (data["gt_patch_warps0_1_prob"].view(b, blk, k)[:, i] > 0.99).float()
+            reg_loss = x**2
+            conf_loss = F.binary_cross_entropy_with_logits(
+                pred["intermediate_flow_conf"].view(b, blk, k)[:, i],
+                data["gt_patch_warps0_1_prob"].view(b, blk, k)[:, i],
+                reduction="none",
+            )
+            valid_mask0 = pred["valid_mask0"][:, i].unsqueeze(-1).expand(b, m, pp).clone()
+            valid_count0 = valid_mask0.sum(dim=-1).sum(dim=-1).clamp(min=1)
+            reg_loss = reg_loss.view(b, m, -1) * valid_mask0
+            reg_loss = reg_loss.view(b, -1).sum(dim=-1) / valid_count0
+            conf_loss = conf_loss.view(b, m, -1) * valid_mask0
+            conf_loss = conf_loss.view(b, -1).sum(dim=-1) / valid_count0
+            return reg_loss, conf_loss
 
-        # B = pred['log_assignment'].shape[0]
-        losses["row_norm"] = pred["log_assignment"].exp()[:, :-1].sum(2).mean(1)
-        for i in range(N - 1):
-            params_i = loss_params(pred, i)
-            nll, _, _ = self.loss_fn(params_i, data, weights=gt_weights)
+        reg_loss, conf_loss = zero.clone(), zero.clone()
+        row_norm = zero.clone()
+        loss_light_last_blk = zero.clone()
+        loss_metrics = {}
+        if self.training or pred["intermediate_ksamples0"] is not None:
+            sum_weights = 1.0
+            N = self.conf.n_blocks
+            for i in range(N):
+                reg_loss, conf_loss = get_refine_loss(pred, data, i)
+                loss_refine = loss_refine + reg_loss + self.conf.loss.refine_conf_weight * conf_loss
+            loss_refine = loss_refine / N
 
-            if self.conf.loss.gamma > 0.0:
-                weight = self.conf.loss.gamma ** (N - i - 1)
-            else:
-                weight = i + 1
-            sum_weights += weight
-            losses["total"] = losses["total"] + nll * weight
+            sum_weights = 1.0
+            nll, gt_weights, loss_metrics = self.loss_fn(loss_params(pred, -1), data)
+            L = pred["ref_descriptors0"].shape[1]
+            loss_light_last_blk = nll.clone().detach()
+            loss_light = nll
 
-            losses["confidence"] += self.token_confidence[i].loss(
-                pred["ref_descriptors0"][:, i],
-                pred["ref_descriptors1"][:, i],
-                params_i["log_assignment"],
-                pred["log_assignment"],
-            ) / (N - 1)
+            # if self.training:
+            #     losses["confidence"] = 0.0
+            confidence = 0.0
 
-            del params_i
-        losses["total"] /= sum_weights
+            # B = pred['log_assignment'].shape[0]
+            row_norm = pred["log_assignment"].exp()[:, :-1].sum(2).mean(1)
+            for i in range(L - 1):
+                params_i = loss_params(pred, i)
+                nll, _, _ = self.loss_fn(params_i, data, weights=gt_weights)
 
-        # confidences
-        if self.training:
-            losses["total"] = losses["total"] + losses["confidence"]
+                if self.conf.loss.gamma > 0.0:
+                    weight = self.conf.loss.gamma ** (L - i - 1)
+                else:
+                    weight = i + 1
+                sum_weights += weight
+                loss_light = loss_light + nll * weight
+
+                # confidence += self.token_confidence[i].loss(
+                #     pred["ref_descriptors0"][:, i],
+                #     pred["ref_descriptors1"][:, i],
+                #     params_i["log_assignment"],
+                #     pred["log_assignment"],
+                # ) / (L - 1)
+
+                del params_i
+            loss_light /= sum_weights
+
+            # confidences
+            if self.training:
+                loss_light = loss_light + confidence
+
+        losses = {
+            "total": nll_init + loss_refine + loss_light,
+            "nll_init": nll_init,
+            "num_init_matches": pred["valid_mask0"][:, 0].sum(-1).float(),
+            "loss_refine": loss_refine,
+            "reg_loss": reg_loss,
+            "conf_loss": conf_loss,
+            "loss_light": loss_light,
+            "row_norm": row_norm,
+            "last": loss_light_last_blk,
+            **loss_metrics,
+            **loss_metrics_init,
+        }
 
         if not self.training:
             # add metrics
@@ -725,4 +997,4 @@ class LightGlue(nn.Module):
         return losses, metrics
 
 
-__main_model__ = LightGlue
+__main_model__ = MagicGlue

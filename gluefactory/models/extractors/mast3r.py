@@ -1216,6 +1216,7 @@ class MASt3R(BaseModel):
         "sparse_outputs": False,
         "dense_outputs": True,
         "points_outputs": False,
+        "coarse_descriptors": False,
         "attention_outputs": False,
         "weights": None,  # local path of pretrained weights
         "randomize_keypoints": True,
@@ -1439,6 +1440,25 @@ class MASt3R(BaseModel):
             pred1 = {
                 "pointcloud": res1['pts3d'],
                 "pointcloud_scores": res1['conf'],
+                **pred1,
+            }
+
+        if self.conf.coarse_descriptors:
+            feat0 = torch.cat([feat0[0], feat0[-1]], dim=-1)
+            feat1 = torch.cat([feat1[0], feat1[-1]], dim=-1)
+            B0, S0, D0 = feat0.shape
+            B1, S1, D1 = feat1.shape
+            # H0, W0 = int(shape0.min()), int(shape0.max())
+            # H1, W1 = int(shape1.min()), int(shape1.max())
+            # TODO: Fix this according to true aspect ratio
+            H0, W0 = shape0[0]
+            H1, W1 = shape1[0]
+            pred0 = {
+                "coarse_descriptors": feat0.transpose(-1, -2).view(B0, D0, H0 // self.conf.patch_size, W0 // self.conf.patch_size),  # B,D,H/p,W/p
+                **pred0,
+            }
+            pred1 = {
+                "coarse_descriptors": feat1.transpose(-1, -2).view(B1, D1, H1 // self.conf.patch_size, W1 // self.conf.patch_size),  # B,D,H/p,W/p,
                 **pred1,
             }
 
