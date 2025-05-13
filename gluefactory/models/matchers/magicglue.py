@@ -658,7 +658,12 @@ class MagicGlue(nn.Module):
 
             shift0, shift1 = self.get_key_shifts(flow_patch0to1.detach(), flow_patch_prob.detach(), size1)
             kpts0[valid_mask0] = (kpts0 + shift0)[valid_mask0]
-            kpts1[torch.arange(b)[:, None], m0, ...][valid_mask0] = (kpts1[torch.arange(b)[:, None], m0, ...] + shift1)[valid_mask0]
+            batch_idx = torch.arange(b, device=kpts1.device)[:, None].expand_as(m0)
+            valid0_flat = valid_mask0.view(-1)
+            flat_batch_idx = batch_idx.reshape(-1)[valid0_flat]
+            flat_kpt_idx = m0.reshape(-1)[valid0_flat]
+            flat_shift1 = shift1.reshape(-1, shift1.shape[-1])[valid0_flat]
+            kpts1[flat_batch_idx, flat_kpt_idx] += flat_shift1
 
             desc0 = F.grid_sample(
                 data["dense_descriptors0"].permute(0, 3, 1, 2).contiguous(),  # (b, d, h, w)
