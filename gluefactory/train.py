@@ -661,7 +661,7 @@ def training(conf, output_dir, args):
 
         epoch += 1
 
-    logger.info(f"Finished training on process {rank}.")
+    logger.info(f"Finished training on process {global_rank}.")
     if global_rank == 0:
         writer.close()
         wandb.finish()
