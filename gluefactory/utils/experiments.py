@@ -73,7 +73,7 @@ def load_experiment(exper, conf={}, get_last=False, ckpt=None):
     else:
         ckpt = exper
     logger.info(f"Loading checkpoint {ckpt.name}")
-    ckpt = torch.load(str(ckpt), map_location="cpu")
+    ckpt = torch.load(str(ckpt), map_location="cpu", weights_only=True)
 
     loaded_conf = OmegaConf.create(ckpt["conf"])
     OmegaConf.set_struct(loaded_conf, False)
