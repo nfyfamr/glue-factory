@@ -645,8 +645,6 @@ class MagicGlue(nn.Module):
                 # kpts0, kpts1 = kpts0[valid_indices0], kpts1[valid_indices1]
 
             # Keypoint correction
-            # TODO: The current assumption is the two image sizes are the same, when calcuating coordinates.
-            assert (size0[0] == size1[0]).all()
             feat_crops0, kpts_smaples0 = self.crop_feature(kpts0, data["dense_descriptors0"], size0)  # (b, d, m, p, p), (b, m, p, p, 2)
             feat_crops1, kpts_smaples1 = self.crop_feature(kpts1, data["dense_descriptors1"], size1)
 
@@ -656,8 +654,9 @@ class MagicGlue(nn.Module):
             all_flow_patch.append(flow_patch0to1)
             all_flow_patch_prob.append(flow_patch_prob)
 
-            shift0, shift1 = self.get_key_shifts(flow_patch0to1.detach(), flow_patch_prob.detach(), size1)
+            shift0, shift1 = self.get_key_shifts(flow_patch0to1.detach(), flow_patch_prob.detach(), size0)
             kpts0[valid_mask0] = (kpts0 + shift0)[valid_mask0]
+            # TODO: Check again kpts1 update logic.
             batch_idx = torch.arange(b, device=kpts1.device)[:, None].expand_as(m0)
             valid0_flat = valid_mask0.view(-1)
             flat_batch_idx = batch_idx.reshape(-1)[valid0_flat]
@@ -783,6 +782,9 @@ class MagicGlue(nn.Module):
         return pred
 
     def crop_feature(self, kpts, desc, size: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Crop 16x16 features in original scale.
+        """
         b, n, _ = kpts.shape
         _, h, w, d = desc.shape
 
@@ -833,7 +835,6 @@ class MagicGlue(nn.Module):
 
         size = size.to(flow_patch0to1)
 
-        # patch_size = self.conf.patch_size
         half_patch = p // 2
         patch_grid = torch.meshgrid(
             torch.linspace(-half_patch, half_patch, p, device=flow_patch0to1.device),
@@ -846,8 +847,6 @@ class MagicGlue(nn.Module):
         patch_grid = patch_grid.expand(b, m, -1, -1, -1)  # (p, p, 2) -> (b, m, p, p, 2)
         patch_grid = patch_grid * 2.0 / size[:, None, None, None, :]
         
-        # shift0 = patch_grid
-        # shift1 = patch_grid + flow_patch0to1
         shift0 = patch_grid[batch_idx, n_idx, h_idx, w_idx]  # (b, m, 2)
         shift1 = shift0 + flow_patch0to1[batch_idx, n_idx, h_idx, w_idx]  # (b, m, p, p, 2)
         return shift0, shift1
@@ -911,8 +910,26 @@ class MagicGlue(nn.Module):
             pp = k // m
             m0 = pred["init_matches0"]  # (b, m)
             patch_warps0_1 = pred["intermediate_ksamples1"].view(b, blk, m, pp, 2)[:, i]  # (b, m, pp, 2)
-            patch_warps0_1 = (patch_warps0_1[torch.arange(b)[:, None], m0, ...]).view(b, -1, 2)  # (b, k, 2)
-            patch_warps0_1 = pred["intermediate_flow"].view(b, blk, k, 2)[:, i] + normalize_keypoints2(patch_warps0_1, data["view0"].get("image_size"))  # (b, k, 2)
+            patch_warps0_1 = (patch_warps0_1[torch.arange(b)[:, None], m0, ...]).view(b, -1, 2)  # rearrange by m0, (b, k, 2)
+
+            ### copy from get_key_shifts...
+            p = int(sqrt(pp))
+            half_patch = p // 2
+            patch_grid = torch.meshgrid(
+                torch.linspace(-half_patch, half_patch, p, device=patch_warps0_1.device),
+                torch.linspace(-half_patch, half_patch, p, device=patch_warps0_1.device),
+                indexing='xy'
+            )
+            patch_grid = torch.stack(patch_grid, dim=-1)  # (p, p, 2)
+            
+            # Normalize grid displacements to feature map scale
+            patch_grid = patch_grid.expand(b, m, -1, -1, -1)  # (p, p, 2) -> (b, m, p, p, 2)
+            patch_grid = patch_grid * 2.0 / data["view0"].get("image_size")[:, None, None, None, :]
+            
+            shift1 = patch_grid.view(b, -1, 2) + pred["intermediate_flow"].view(b, blk, k, 2)[:, i]
+            ###
+
+            patch_warps0_1 = shift1 + normalize_keypoints2(patch_warps0_1, data["view1"].get("image_size"))  # (b, k, 2)
             # TODO: in float16 mode, the generated data["gt_patch_warps0_1"] contains inf values due to range of float16.
             # Need to handle this case, possibly by generate it in normalized coordinates.
             epe = (patch_warps0_1 - normalize_keypoints2(data["gt_patch_warps0_1"].view(b, blk, k, 2)[:, i], data["view1"].get("image_size"))).norm(dim=-1)
