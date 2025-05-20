@@ -36,6 +36,7 @@ dependencies = [
     "kapture-localization",
     "numpy-quaternion",
     "roma",
+    "filetype",
     "lightglue @ git+https://github.com/cvg/LightGlue.git",
 ]
 urls = {Repository = "https://github.com/cvg/glue-factory"}

@@ -65,3 +65,7 @@ benchmarks:
       eval:
         estimator: opencv
         ransac_th: 0.5
+      preprocessing:
+        side: long
+        resize: 512
+        edge_divisible_by: 16

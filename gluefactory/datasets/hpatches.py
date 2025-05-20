@@ -5,6 +5,8 @@ Simply load images from a folder or nested folders (does not have any split).
 import argparse
 import logging
 import tarfile
+import zipfile
+import filetype
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -54,7 +56,7 @@ class HPatches(BaseDataset, torch.utils.data.Dataset):
         "v_astronautis",
         "v_talent",
     )
-    url = "http://icvl.ee.ic.ac.uk/vbalnt/hpatches/hpatches-sequences-release.tar.gz"
+    url = "https://www.kaggle.com/api/v1/datasets/download/javidtheimmortal/hpatches-sequence-release"
 
     def _init(self, conf):
         assert conf.batch_size == 1
@@ -79,11 +81,18 @@ class HPatches(BaseDataset, torch.utils.data.Dataset):
     def download(self):
         data_dir = self.root.parent
         data_dir.mkdir(exist_ok=True, parents=True)
-        tar_path = data_dir / self.url.rsplit("/", 1)[-1]
-        torch.hub.download_url_to_file(self.url, tar_path)
-        with tarfile.open(tar_path) as tar:
-            tar.extractall(data_dir)
-        tar_path.unlink()
+        achv_path = data_dir / self.url.rsplit("/", 1)[-1]
+        torch.hub.download_url_to_file(self.url, achv_path)
+        achv_type = filetype.guess(achv_path)
+        if achv_type.extension == "zip":
+            with zipfile.ZipFile(achv_path) as achv:
+                achv.extractall(data_dir)
+        elif achv_type.extension in ("gz", "bz2", "xz", "tar"):
+            with decompsr.open(achv_path) as achv:
+                achv.extractall(data_dir)
+        else:
+            raise ValueError(f"{achv_path} is not a valid archive.")
+        achv_path.unlink()
 
     def get_dataset(self, split):
         assert split in ["val", "test"]
