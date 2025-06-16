@@ -366,6 +366,60 @@ def filter_matches(scores: torch.Tensor, th: float):
     return m0, m1, mscores0, mscores1
 
 
+def log_sigmoid_double(
+    corres: torch.Tensor, z0: torch.Tensor, z1: torch.Tensor
+) -> torch.Tensor:
+    """create the log assignment matrix from logits and similarity"""
+    b, m, n = corres.shape
+    certainties = F.logsigmoid(z0) + F.logsigmoid(z1).transpose(1, 2)
+    probs = corres.new_full((b, m + 1, n + 1), 0)
+    probs[:, :m, :n] = F.logsigmoid(corres) + certainties
+    probs[:, :-1, -1] = F.logsigmoid(-z0.squeeze(-1))
+    probs[:, -1, :-1] = F.logsigmoid(-z1.squeeze(-1))
+    return probs
+
+
+class LooseMatchAssignment(nn.Module):
+    def __init__(self, in_dim, dim: int) -> None:
+        super().__init__()
+        self.dim = dim
+        self.matchability = nn.Linear(in_dim, 1, bias=True)
+        self.final_proj = nn.Linear(in_dim, dim, bias=True)
+        self.correspondencies = nn.Linear(2 * dim, 1, bias=True)
+
+    def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
+        """build assignment matrix from descriptors"""
+        """This version generate multiple assignment for a keypoint"""
+        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+        b, m, d = mdesc0.shape
+        _, n, _ = mdesc1.shape
+        mdesc0 = mdesc0.unsqueeze(2).expand(-1, m, n, -1)  # (b, m, n, d)
+        mdesc1 = mdesc1.unsqueeze(1).expand(-1, m, n, -1)  # (b, m, n, d)
+        feats = torch.cat([mdesc0, mdesc1], dim=-1).view(b * m * n, -1)  # (b*m*n, 2d)
+        corres = self.correspondencies(feats).view(b, m, n)
+        z0 = self.matchability(desc0)
+        z1 = self.matchability(desc1)
+        log_mutual_probs = log_sigmoid_double(corres, z0, z1)
+        return log_mutual_probs, corres
+
+    def get_matchability(self, desc: torch.Tensor):
+        return torch.sigmoid(self.matchability(desc)).squeeze(-1)
+
+
+def filter_matches2(probs: torch.Tensor, th: float):
+    """obtain matches from a log assignment matrix [Bx M+1 x N+1]"""
+    b, m, n = probs[:, :-1, :-1].shape
+    mask = probs[:, :-1, :-1] > torch.tensor(th, device=probs.device).log()
+    # b_idx, i_idx, j_idx = mask.nonzero(as_tuple=True)
+    # m_idx = i_idx * n + j_idx
+    # m0 = torch.full((b, m * n), -1, device=probs.device, dtype=torch.int32)
+    # m1 = torch.full_like(m0, -1)
+    # m0[b_idx, m_idx] = j_idx.to(torch.int32)
+    # m1[b_idx, m_idx] = i_idx.to(torch.int32)
+    # return m0, m1
+    return mask
+
+
 class KeyCorrection(nn.Module):
     def __init__(self, input_dim=24, hidden_dim=512, output_dim=3, bn_momentum=0.01):
         super().__init__()
@@ -402,33 +456,30 @@ class KeyCorrection(nn.Module):
         )
         self.head = nn.Conv2d(64, output_dim, kernel_size=1)
 
-    def forward(self, feat0, feat1, m0):
-        feat0 = feat0.permute(0, 2, 3, 4, 1).contiguous()  # (b, d, m, p, p) -> (b, m, p, p, d)
-        feat1 = feat1.permute(0, 2, 3, 4, 1).contiguous()
-        b, m, p, _, d = feat0.shape
+    def forward(self, feat0, feat1):
+        b, d, k, p, _ = feat0.shape
         
-        feat1 = feat1[torch.arange(b)[:, None], m0, ...]
-        f = torch.cat([feat0, feat1], dim=-1)  # (b, m, p, p, 2*d)
-        f = f.permute(0, 1, 4, 2, 3).contiguous().view(b*m, 2*d, p, p)
+        f = torch.cat([feat0, feat1], dim=1)  # (b, 2d, k, p, p)
+        f = f.permute(0, 2, 1, 3, 4).contiguous().view(b*k, 2*d, p, p)
 
-        e1 = self.enc1(f)  # (bm, 64, 16, 16)
-        e2 = self.pool(e1)  # (bm, 64, 8, 8)
+        e1 = self.enc1(f)  # (bk, 64, 16, 16)
+        e2 = self.pool(e1)  # (bk, 64, 8, 8)
 
-        e2 = self.enc2(e2)  # (bm, 128, 8, 8)
-        e3 = self.pool(e2)  # (bm, 128, 4, 4)
+        e2 = self.enc2(e2)  # (bk, 128, 8, 8)
+        e3 = self.pool(e2)  # (bk, 128, 4, 4)
 
-        e3 = self.enc3(e3)  # (bm, 256, 4, 4)
+        e3 = self.enc3(e3)  # (bk, 256, 4, 4)
         
-        d1 = self.up1(e3)  # (bm, 128, 8, 8)
-        d1 = torch.cat([d1, e2], dim=1)  # (bm, 128+128, 8, 8)
-        d1 = self.dec1(d1)  # (bm, 128, 8, 8)
+        d1 = self.up1(e3)  # (bk, 128, 8, 8)
+        d1 = torch.cat([d1, e2], dim=1)  # (bk, 128+128, 8, 8)
+        d1 = self.dec1(d1)  # (bk, 128, 8, 8)
         
-        d2 = self.up2(d1)  # (bm, 64, 16, 16)
-        d2 = torch.cat([d2, e1], dim=1)  # (bm, 64+64, 16, 16)
-        d2 = self.dec2(d2)  # (bm, 64, 16, 16)
+        d2 = self.up2(d1)  # (bk, 64, 16, 16)
+        d2 = torch.cat([d2, e1], dim=1)  # (bk, 64+64, 16, 16)
+        d2 = self.dec2(d2)  # (bk, 64, 16, 16)
         
-        out = self.head(d2)  # (bm, 3, 16, 16)
-        out = out.view(b, m, 3, p, p).permute(0, 1, 3, 4, 2).contiguous()  # (b, m, p, p, 3)
+        out = self.head(d2)  # (bk, 3, 16, 16)
+        out = out.view(b, k, 3, p, p).permute(0, 1, 3, 4, 2).contiguous()  # (b, k, p, p, 3)
         offset, conf = out[..., :2], out[..., 2]
         return offset, conf
 
@@ -449,6 +500,7 @@ class MagicGlue(nn.Module):
         "mp": False,  # enable mixed precision
         "depth_confidence": -1,  # early stopping, disable with -1
         "width_confidence": -1,  # point pruning, disable with -1
+        "loose_match_prob_threshold": 0.5,
         "filter_threshold": 0.0,  # match threshold
         "checkpointed": False,
         "weights": None,  # either a path or the name of pretrained weights (disk, ...)
@@ -493,7 +545,7 @@ class MagicGlue(nn.Module):
             [TransformerLayer(d, h, conf.flash) for _ in range(n)]
         )
 
-        self.init_log_assignment = MatchAssignment(conf.input_dim + conf.input_coarse_dim)
+        self.init_log_assignment = LooseMatchAssignment(conf.input_coarse_dim, conf.descriptor_dim)
         self.key_corretion = nn.ModuleList([KeyCorrection(conf.input_dim) for _ in range(conf.n_blocks)])
         self.log_assignment = nn.ModuleList([MatchAssignment(d) for _ in range(conf.n_blocks)])
         # self.token_confidence = nn.ModuleList(
@@ -581,41 +633,48 @@ class MagicGlue(nn.Module):
         desc1 = data["descriptors1"].contiguous()
 
         # combine features: fine(24) + coarse(1792)
-        if "coarse_descriptors0" in data.keys() and "coarse_descriptors1" in data.keys():
-            patch_size = self.conf.patch_size
-            _, cd, ch0, cw0 = data["coarse_descriptors0"].shape  # d: 1024+768
-            _, cd, ch1, cw1 = data["coarse_descriptors1"].shape
+        # if "coarse_descriptors0" in data.keys() and "coarse_descriptors1" in data.keys():
+        #     patch_size = self.conf.patch_size
+        #     _, cd, ch0, cw0 = data["coarse_descriptors0"].shape  # d: 1024+768
+        #     _, cd, ch1, cw1 = data["coarse_descriptors1"].shape
 
-            coarse_desc0 = data["coarse_descriptors0"].flatten(2)
-            coarse_desc1 = data["coarse_descriptors1"].flatten(2)
+        #     coarse_desc0 = data["coarse_descriptors0"].flatten(2)
+        #     coarse_desc1 = data["coarse_descriptors1"].flatten(2)
 
-            kpts_coarse0 = (data["keypoints0"] // patch_size).long()
-            kpts_coarse1 = (data["keypoints1"] // patch_size).long()
-            kpts_coarse0_flat = kpts_coarse0[..., 1] * cw0 + kpts_coarse0[..., 0]  # (b, m)
-            kpts_coarse1_flat = kpts_coarse1[..., 1] * cw1 + kpts_coarse1[..., 0]
+        #     kpts_coarse0 = (data["keypoints0"] // patch_size).long()
+        #     kpts_coarse1 = (data["keypoints1"] // patch_size).long()
+        #     kpts_coarse0_flat = kpts_coarse0[..., 1] * cw0 + kpts_coarse0[..., 0]  # (b, m)
+        #     kpts_coarse1_flat = kpts_coarse1[..., 1] * cw1 + kpts_coarse1[..., 0]
 
-            coarse_desc0 = torch.gather(coarse_desc0, 2, kpts_coarse0_flat.unsqueeze(1).expand(-1, cd, -1))  # (b, cd, m)
-            coarse_desc1 = torch.gather(coarse_desc1, 2, kpts_coarse1_flat.unsqueeze(1).expand(-1, cd, -1))
-            coarse_desc0 = coarse_desc0.transpose(1, 2)  # (b, m, cd)
-            coarse_desc1 = coarse_desc1.transpose(1, 2)
+        #     coarse_desc0 = torch.gather(coarse_desc0, 2, kpts_coarse0_flat.unsqueeze(1).expand(-1, cd, -1))  # (b, cd, m)
+        #     coarse_desc1 = torch.gather(coarse_desc1, 2, kpts_coarse1_flat.unsqueeze(1).expand(-1, cd, -1))
+        #     coarse_desc0 = coarse_desc0.transpose(1, 2)  # (b, m, cd)
+        #     coarse_desc1 = coarse_desc1.transpose(1, 2)
 
-            desc0 = torch.cat([desc0, coarse_desc0], dim=2)  # (b, m, xd)
-            desc1 = torch.cat([desc1, coarse_desc1], dim=2)
+        #     desc0 = torch.cat([desc0, coarse_desc0], dim=2)  # (b, m, xd)
+        #     desc1 = torch.cat([desc1, coarse_desc1], dim=2)
 
-        assert desc0.shape[-1] == (self.conf.input_dim + self.conf.input_coarse_dim)
-        assert desc1.shape[-1] == (self.conf.input_dim + self.conf.input_coarse_dim)
+        # assert desc0.shape[-1] == (self.conf.input_dim + self.conf.input_coarse_dim)
+        # assert desc1.shape[-1] == (self.conf.input_dim + self.conf.input_coarse_dim)
+        _, cd, ch0, cw0 = data["coarse_descriptors0"].shape
+        _, cd, ch1, cw1 = data["coarse_descriptors1"].shape
+        desc0 = data["coarse_descriptors0"].permute(0, 2, 3, 1).view(b, -1, cd).contiguous()  # (b, ch0*cw0, cd)
+        desc1 = data["coarse_descriptors1"].permute(0, 2, 3, 1).view(b, -1, cd).contiguous()  # (b, ch0*cw0, cd)
+        assert desc0.shape[-1] == self.conf.input_coarse_dim
+        assert desc1.shape[-1] == self.conf.input_coarse_dim
         if torch.is_autocast_enabled():
             desc0 = desc0.half()
             desc1 = desc1.half()
 
         # Initial matching
-        scores, sims = self.init_log_assignment(desc0, desc1)
-        m0, m1, mscores0, mscores1 = filter_matches(scores, self.conf.filter_threshold)
-        init_scores = scores.clone()
-        init_sims = sims.clone()
+        match_probs, corres = self.init_log_assignment(desc0, desc1)
+        assign = filter_matches2(match_probs, self.conf.loose_match_prob_threshold)
+        # m0, m1 = filter_matches2(match_probs, self.conf.loose_match_prob_threshold)
+        init_match_probs = match_probs.clone()
+        # init_m0 = m0.clone()
+        init_assign = assign.clone()
         init_kpts0 = kpts0.clone()
         init_kpts1 = kpts1.clone()
-        init_m0 = m0.clone()
 
         all_ksamples0, all_ksamples1 = [], []
         all_flow_patch, all_flow_patch_prob = [], []
@@ -627,16 +686,9 @@ class MagicGlue(nn.Module):
         # During inference, run the rest modules only with valid matches.
         # During training, run the rest modules with valid masking.
         for blk in range(self.conf.n_blocks):
-            valid_mask0 = (m0 > -1)
-            valid_mask1 = torch.zeros_like(m1, dtype=torch.bool)
-            rows, cols = valid_mask0.nonzero(as_tuple=True)
-            valid_mask1[rows, m0[rows, cols]] = True
-            all_valid_mask0.append(valid_mask0)
-            all_valid_mask1.append(valid_mask1)
-
-            if not self.training:
-                if (m0 == -1).all():
-                    break
+            # if not self.training:
+            #     if (m0 == -1).all():
+            #         break
                 
                 # TODO: Reduce inference time workload
                 # valid_indices0 = valid_mask0.nonzero(as_tuple=True)[0]
@@ -646,24 +698,106 @@ class MagicGlue(nn.Module):
                 # kpts0, kpts1 = kpts0[valid_indices0], kpts1[valid_indices1]
 
             # Keypoint correction
-            feat_crops0, kpts_smaples0 = self.crop_feature(kpts0, data["dense_descriptors0"], size0)  # (b, d, m, p, p), (b, m, p, p, 2)
-            feat_crops1, kpts_smaples1 = self.crop_feature(kpts1, data["dense_descriptors1"], size1)
+            if blk == 0:
+                # with the expense of a little overhead, it is possible to use only crop_feature
+                feat_crops0, kpts_smaples0 = self.crop_patch(data["dense_descriptors0"], size0)  # (b, d, m, p, p), (b, m, p, p, 2)
+                feat_crops1, kpts_smaples1 = self.crop_patch(data["dense_descriptors1"], size1)
 
-            flow_patch0to1, flow_patch_prob = self.key_corretion[blk](feat_crops0, feat_crops1, m0)  # (b, m, p, p, 2), (b, m, p, p)
+                _, d, m, p, _ = feat_crops0.shape
+                k = assign.sum(dim=(-2, -1)).max().clamp(min=1)  # k: num of max matches
+                k = min(k , 1024)
+                f0s = torch.zeros(b, d, k, p, p, device=device, dtype=feat_crops0.dtype)
+                f1s = torch.zeros(b, d, k, p, p, device=device, dtype=feat_crops1.dtype)
+                k0s = torch.zeros(b, k, p, p, 2, device=device, dtype=kpts_smaples0.dtype)
+                k1s = torch.zeros(b, k, p, p, 2, device=device, dtype=kpts_smaples1.dtype)
+                valid_mask0 = torch.zeros(b, k, device=device, dtype=torch.bool)
+                valid_mask1 = torch.zeros(b, k, device=device, dtype=torch.bool)
+
+                for i in range(b):
+                    indices = assign[i].nonzero(as_tuple=False)
+                    if indices.numel() == 0:
+                        m_idx = torch.tensor([0], device=device)
+                        n_idx = torch.tensor([0], device=device)
+                    else:
+                        m_idx, n_idx = indices[:, 0], indices[:, 1]
+                        valid_mask0[i, :len(m_idx)] = True
+                        valid_mask1[i, :len(m_idx)] = True
+
+                    num = min(k, len(m_idx))
+                    f0s[i, :, :num] = feat_crops0[i, :, m_idx[:num], :, :]   # (d, num, p, p)
+                    f1s[i, :, :num] = feat_crops1[i, :, n_idx[:num], :, :]
+                    k0s[i, :num] = kpts_smaples0[i, m_idx[:num], :, :, :]  # (num, p, p, 2)
+                    k1s[i, :num] = kpts_smaples1[i, n_idx[:num], :, :, :]
+
+                    y0, x0 = m_idx // cw0, m_idx % cw0
+                    y1, x1 = n_idx // cw1, n_idx % cw1
+                
+                # TODO: update logic more robust
+                # Current trick resort to the fact that the num of keypoints will not over 768
+                kpts_smaples0 = k0s[:, :k]
+                kpts_smaples1 = k1s[:, :k]
+                kpts0 = kpts0[:, :k]
+                kpts1 = kpts1[:, :k]
+                valid_mask0 = valid_mask0[:, :k]
+                valid_mask1 = valid_mask1[:, :k]
+                f0s = f0s[:, :, :k, :, :]
+                f1s = f1s[:, :, :k, :, :]
+            else:
+                valid_mask0 = (m0 > -1)
+                valid_mask1 = torch.zeros_like(m1, dtype=torch.bool)
+                rows, cols = valid_mask0.nonzero(as_tuple=True)
+                valid_mask1[rows, m0[rows, cols]] = True
+
+                feat_crops0, kpts_smaples0 = self.crop_feature(kpts0, data["dense_descriptors0"], size0)  # (b, d, m, p, p), (b, m, p, p, 2)
+                feat_crops1, kpts_smaples1 = self.crop_feature(kpts1, data["dense_descriptors1"], size1)
+
+                f0s = feat_crops0.contiguous()
+                f1s = feat_crops1.permute(0, 2, 1, 3, 4).contiguous()  # (b, d, m, p, p) -> (b, m, d, p, p)
+                f1s = f1s[torch.arange(b)[:, None], m0, ...]
+                f1s = f1s.permute(0, 2, 1, 3, 4).contiguous()  # (b, m, d, p, p) -> (b, d, m, p, p)
+
+            all_valid_mask0.append(valid_mask0)
+            all_valid_mask1.append(valid_mask1)
+
+            flow_patch0to1, flow_patch_prob = self.key_corretion[blk](f0s, f1s)  # (b, k, p, p, 2), (b, k, p, p)
+            # flow_patch0to1 = torch.zeros((b, k, p, p, 2), device=f0s.device, dtype=f0s.dtype)
+            # flow_patch_prob = torch.zeros((b, k, p, p), device=f0s.device, dtype=f0s.dtype)
+            # chunk_size = 512
+            # print(k)
+            # for start in range(0, k, chunk_size):
+            #     end = min(start + chunk_size, k)
+            #     flow, prob = self.key_corretion[blk](f0s[:, :, start:end], f1s[:, :, start:end])
+            #     flow_patch0to1[:, start:end] = flow
+            #     flow_patch_prob[:, start:end] = prob
+
             all_ksamples0.append(kpts_smaples0)
             all_ksamples1.append(kpts_smaples1)
             all_flow_patch.append(flow_patch0to1)
             all_flow_patch_prob.append(flow_patch_prob)
 
-            shift0, shift1 = self.get_key_shifts(flow_patch0to1.detach(), flow_patch_prob.detach(), size0)
-            kpts0[valid_mask0] = (kpts0 + shift0)[valid_mask0]
-            # TODO: Check again kpts1 update logic.
-            batch_idx = torch.arange(b, device=kpts1.device)[:, None].expand_as(m0)
-            valid0_flat = valid_mask0.view(-1)
-            flat_batch_idx = batch_idx.reshape(-1)[valid0_flat]
-            flat_kpt_idx = m0.reshape(-1)[valid0_flat]
-            flat_shift1 = shift1.reshape(-1, shift1.shape[-1])[valid0_flat]
-            kpts1[flat_batch_idx, flat_kpt_idx] += flat_shift1
+            # TODO: consider blk >= 1
+            # shift0, shift1 = self.get_key_shifts(flow_patch0to1.detach(), flow_patch_prob.detach(), size0)
+            if blk == 0:
+            #     kpts0[valid_mask0] = (kpts0 + shift0)[valid_mask0]
+            #     kpts1[valid_mask1] = (kpts1 + shift1)[valid_mask1]
+                flow_patch_prob_flat = flow_patch_prob.view(b, k, -1)  # (b, k, p*p)
+                max_idx = flow_patch_prob_flat.argmax(dim=-1)  # (b, m)
+                h_idx = max_idx // p   # row index
+                w_idx = max_idx % p    # col index
+                batch_idx = torch.arange(b).unsqueeze(1).expand(b, k)  # (b, k)
+                k_idx = torch.arange(k).unsqueeze(0).expand(b, k)      # (b, k)
+                kpts0 = kpts_smaples0[batch_idx, k_idx, h_idx, w_idx]  # (b, k, 2)
+                kpts1 = kpts_smaples1[batch_idx, k_idx, h_idx, w_idx] + flow_patch0to1[batch_idx, k_idx, h_idx, w_idx]  # (b, k, 2)
+            else:
+                shift0, shift1 = self.get_key_shifts(flow_patch0to1.detach(), flow_patch_prob.detach(), size0)
+                kpts0[valid_mask0] = (kpts0 + shift0)[valid_mask0]
+                # TODO: Check again kpts1 update logic.
+                batch_idx = torch.arange(b, device=kpts1.device)[:, None].expand_as(m0)
+                valid0_flat = valid_mask0.view(-1)
+                flat_batch_idx = batch_idx.reshape(-1)[valid0_flat]
+                flat_kpt_idx = m0.reshape(-1)[valid0_flat]
+                flat_shift1 = shift1.reshape(-1, shift1.shape[-1])[valid0_flat]
+                kpts1[flat_batch_idx, flat_kpt_idx] += flat_shift1
 
             desc0 = F.grid_sample(
                 data["dense_descriptors0"].permute(0, 3, 1, 2).contiguous(),  # (b, d, h, w)
@@ -705,10 +839,10 @@ class MagicGlue(nn.Module):
             for i in range(self.conf.n_layers):
                 if self.conf.checkpointed and self.training:
                     desc0, desc1 = checkpoint(
-                        self.transformers[i], desc0, desc1, encoding0, encoding1, use_reentrant=False
+                        self.transformers[i], desc0, desc1, encoding0, encoding1, valid_mask0[:, None, :, None], valid_mask1[:, None, :, None], use_reentrant=False
                     )
                 else:
-                    desc0, desc1 = self.transformers[i](desc0, desc1, encoding0, encoding1)
+                    desc0, desc1 = self.transformers[i](desc0, desc1, encoding0, encoding1, valid_mask0[:, None, :, None], valid_mask1[:, None, :, None])
                 # if self.training or i == self.conf.n_layers - 1:
             all_desc0.append(desc0)
             all_desc1.append(desc1)
@@ -738,9 +872,11 @@ class MagicGlue(nn.Module):
             #     encoding1 = encoding1.index_select(-2, keep1)
             #     prune1[:, ind1] += 1
 
-            desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]
+            # desc0, desc1 = desc0[..., :m, :], desc1[..., :n, :]
             scores, _ = self.log_assignment[blk](desc0, desc1)
             m0, m1, mscores0, mscores1 = filter_matches(scores, self.conf.filter_threshold)
+            m0[~valid_mask0] = -1
+            m1[~valid_mask1] = -1
 
         if do_point_pruning:
             m0_ = torch.full((b, m), -1, device=m0.device, dtype=m0.dtype)
@@ -765,10 +901,11 @@ class MagicGlue(nn.Module):
             "matching_scores1": mscores1,
             "init_keypoints0": denormalize_keypoints2(init_kpts0, size0),
             "init_keypoints1": denormalize_keypoints2(init_kpts1, size1),
-            "init_matches0": init_m0,
-            "init_log_assignment": init_scores,
+            "init_assign": init_assign,
+            "init_log_assignment": init_match_probs,
             "valid_mask0": torch.stack(all_valid_mask0, 1),
             "valid_mask1": torch.stack(all_valid_mask1, 1),
+            # TODO: This is not intermediate keypoints nomore. Rather, it is patch grids.
             "intermediate_ksamples0": denormalize_keypoints2(torch.stack(all_ksamples0, 1).view(b, -1, 2), size0) if len(all_ksamples0) > 0 else None,
             "intermediate_ksamples1": denormalize_keypoints2(torch.stack(all_ksamples1, 1).view(b, -1, 2), size1) if len(all_ksamples1) > 0 else None,
             "intermediate_flow": torch.stack(all_flow_patch, 1).view(b, -1, 2) if len(all_flow_patch) > 0 else None,
@@ -824,6 +961,35 @@ class MagicGlue(nn.Module):
             )  # (1, d, n*patch_size*patch_size, 1)
             patches[i] = batch_patches.view(d, n, patch_size, patch_size)
         return patches, sampling_grid.view(b, n, patch_size, patch_size, 2)
+
+    def crop_patch(self, desc, size: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Crop 16x16 features in original scale.
+        """
+        b, h, w, d = desc.shape
+
+        p = self.conf.patch_size
+        ph, pw = h // p, w // p
+        n = ph * pw
+
+        # TODO: use geometry.utils.get_image_coords(img)
+        # patch_grid = get_image_coords(desc.permute(0, 3, 1, 2)) - 0.5  # Debias half-pixel Offset, (1, h, w, 2)
+        patch_grid = torch.meshgrid(
+            torch.linspace(-1, 1, w, device=desc.device),
+            torch.linspace(-1, 1, h, device=desc.device),
+            indexing='xy'
+        )
+        patch_grid = torch.stack(patch_grid, dim=-1)  # (h, w, 2)
+        patch_grid = patch_grid.view(ph, p, pw, p, 2).permute(0, 2, 1, 3, 4).contiguous()  # (ph, pw, p, p, 2)
+        patch_grid = patch_grid.view(n, p, p, 2)  # (n, p, p, 2)
+        patch_grid = patch_grid.unsqueeze(0).expand(b, -1, -1, -1, -1)
+
+        desc = desc.permute(0, 3, 1, 2).contiguous()  # (b, d, h, w)
+        patches = F.unfold(desc, kernel_size=p, stride=p)  # (b, d*p*p, n)
+        patches = patches.view(b, d, p, p, -1)  # (b, d, p, p, n)
+        patches = patches.permute(0, 1, 4, 2, 3)  # (b, d, n, p, p)
+
+        return patches, patch_grid
 
     def get_key_shifts(self, flow_patch0to1, flow_patch_prob, size) -> torch.Tensor:
         b, m, p, _ = flow_patch_prob.shape
@@ -904,48 +1070,59 @@ class MagicGlue(nn.Module):
         
         # Regression loss
         def get_refine_loss(pred, data, i):
-            b, blk_k, _ = pred["intermediate_flow"].shape  # k = m*p*p
-            _, m = pred["init_matches0"].shape
+            b, blk_kpp, _ = pred["intermediate_flow"].shape
+            _, m, n = pred["init_assign"].shape
             blk = self.conf.n_blocks
-            k = blk_k // blk
-            pp = k // m
-            m0 = pred["init_matches0"]  # (b, m)
-            patch_warps0_1 = pred["intermediate_ksamples1"].view(b, blk, m, pp, 2)[:, i]  # (b, m, pp, 2)
-            patch_warps0_1 = (patch_warps0_1[torch.arange(b)[:, None], m0, ...]).view(b, -1, 2)  # rearrange by m0, (b, k, 2)
+            kpp = blk_kpp // blk  # k: max num of keypoints over batch
+            p = self.conf.patch_size
+            pp = p**2
+            k = kpp // pp
+            # m0 = pred["init_assign"]  # (b, m)
 
+            ################ patch_center1 + patch_grids1 + flow
+            # valid_mask0 = pred["valid_mask0"][:, i]  # (b, k)
+            # init_keypoints1 = normalize_keypoints2(pred["init_keypoints1"], data["view1"].get("image_size"))  # (b, k, 2)
+            # init_keypoints1 = init_keypoints1.unsqueeze(-2).expand(-1, -1, pp, -1)  # (b, k, pp, 2)
+            patch_grids1 = normalize_keypoints2(pred["intermediate_ksamples1"], data["view1"].get("image_size"))
+            patch_grids1 = patch_grids1.view(b, blk, k, pp, 2)[:, i]  # (b, k, pp, 2)
+            patch_warps0_1 = pred["intermediate_flow"].view(b, blk, k, pp, 2)[:, i]  # (b, k, pp, 2)
+
+            # patch_warps0_1 = patch_warps0_1 + init_keypoints1 + patch_grids1  # (b, k, pp, 2)
+            patch_warps0_1 = patch_warps0_1 + patch_grids1  # (b, k, pp, 2)
+            patch_warps0_1 = patch_warps0_1.view(b, kpp, 2)
+            
             ### copy from get_key_shifts...
-            p = int(sqrt(pp))
-            half_patch = p // 2
-            patch_grid = torch.meshgrid(
-                torch.linspace(-half_patch, half_patch, p, device=patch_warps0_1.device),
-                torch.linspace(-half_patch, half_patch, p, device=patch_warps0_1.device),
-                indexing='xy'
-            )
-            patch_grid = torch.stack(patch_grid, dim=-1)  # (p, p, 2)
+            # half_patch = p / 2
+            # patch_grid = torch.meshgrid(
+            #     torch.linspace(-half_patch, half_patch, p, device=patch_warps0_1.device),
+            #     torch.linspace(-half_patch, half_patch, p, device=patch_warps0_1.device),
+            #     indexing='xy'
+            # )
+            # patch_grid = torch.stack(patch_grid, dim=-1)  # (p, p, 2)
             
-            # Normalize grid displacements to feature map scale
-            patch_grid = patch_grid.expand(b, m, -1, -1, -1)  # (p, p, 2) -> (b, m, p, p, 2)
-            patch_grid = patch_grid * 2.0 / data["view0"].get("image_size")[:, None, None, None, :]
+            # # Normalize grid displacements to feature map scale
+            # patch_grid = patch_grid.expand(b, m, -1, -1, -1)  # (p, p, 2) -> (b, m, p, p, 2)
+            # patch_grid = patch_grid * 2.0 / data["view0"].get("image_size")[:, None, None, None, :]
             
-            shift1 = patch_grid.view(b, -1, 2) + pred["intermediate_flow"].view(b, blk, k, 2)[:, i]
-            ###
+            # shift1 = patch_grid.view(b, -1, 2) + pred["intermediate_flow"].view(b, blk, k, pp, 2)[:, i]
+            # ###
 
-            patch_warps0_1 = shift1 + normalize_keypoints2(patch_warps0_1, data["view1"].get("image_size"))  # (b, k, 2)
+            # patch_warps0_1 = shift1 + normalize_keypoints2(patch_warps0_1, data["view1"].get("image_size"))  # (b, k, 2)
             # TODO: in float16 mode, the generated data["gt_patch_warps0_1"] contains inf values due to range of float16.
             # Need to handle this case, possibly by generate it in normalized coordinates.
-            epe = (patch_warps0_1 - normalize_keypoints2(data["gt_patch_warps0_1"].view(b, blk, k, 2)[:, i], data["view1"].get("image_size"))).norm(dim=-1)
-            x = epe * (data["gt_patch_warps0_1_prob"].view(b, blk, k)[:, i] > 0.99).float()
+            epe = (patch_warps0_1 - normalize_keypoints2(data["gt_patch_warps0_1"].view(b, blk, kpp, 2)[:, i], data["view1"].get("image_size"))).norm(dim=-1)  # (b, kpp)
+            x = epe * (data["gt_patch_warps0_1_prob"].view(b, blk, kpp)[:, i] > 0.99).float()
             reg_loss = x**2
             conf_loss = F.binary_cross_entropy_with_logits(
-                pred["intermediate_flow_conf"].view(b, blk, k)[:, i],
-                data["gt_patch_warps0_1_prob"].view(b, blk, k)[:, i],
+                pred["intermediate_flow_conf"].view(b, blk, kpp)[:, i],
+                data["gt_patch_warps0_1_prob"].view(b, blk, kpp)[:, i],
                 reduction="none",
             )
-            valid_mask0 = pred["valid_mask0"][:, i].unsqueeze(-1).expand(b, m, pp).clone()
+            valid_mask0 = pred["valid_mask0"][:, i].unsqueeze(-1).expand(-1, -1, pp)
             valid_count0 = valid_mask0.sum(dim=-1).sum(dim=-1).clamp(min=1)
-            reg_loss = reg_loss.view(b, m, -1) * valid_mask0
+            reg_loss = reg_loss.view(b, k, pp) * valid_mask0
             reg_loss = reg_loss.view(b, -1).sum(dim=-1) / valid_count0
-            conf_loss = conf_loss.view(b, m, -1) * valid_mask0
+            conf_loss = conf_loss.view(b, k, pp) * valid_mask0
             conf_loss = conf_loss.view(b, -1).sum(dim=-1) / valid_count0
             return reg_loss, conf_loss
 
@@ -1008,6 +1185,7 @@ class MagicGlue(nn.Module):
             "loss_light": loss_light,
             "row_norm": row_norm,
             "last": loss_light_last_blk,
+            "peak_match": pred["init_assign"].sum(dim=(-2, -1)).max().float().expand(1),
             **loss_metrics,
             **loss_metrics_init,
         }

@@ -5,6 +5,7 @@ from scipy.optimize import linear_sum_assignment
 from .depth import project, sample_depth
 from .epipolar import T_to_E, sym_epipolar_distance_all
 from .homography import warp_points_torch
+from .utils import get_image_coords
 
 IGNORE_FEATURE = -2
 UNMATCHED_FEATURE = -1
@@ -158,6 +159,70 @@ def gt_matches_from_homography(kp0, kp1, H, pos_th=3, neg_th=6, **kw):
         "matching_scores1": (m1 > -1).float(),
         "proj_0to1": kp0_1,
         "proj_1to0": kp1_0,
+    }
+
+
+@torch.no_grad()
+def gt_patch_matches_from_homography(data, H, patch_size=16, pos_th=3, neg_th=0, **kw):
+    # pos_th and neg_th is in number of intersected pixels.
+    b, _, _ = H.shape
+    h0, w0 = data["view0"]["image"].shape[-2:]
+    h1, w1 = data["view1"]["image"].shape[-2:]
+    ph0, pw0 = h0 // patch_size, w0 // patch_size
+    ph1, pw1 = h1 // patch_size, w1 // patch_size
+    m = ph0 * pw0
+    n = ph1 * pw1
+
+    kp0 = get_image_coords(data["view0"]["image"]) - 0.5  # Debias half-pixel Offset
+    kp1 = get_image_coords(data["view1"]["image"]) - 0.5  # (1, h1, w1, 2)
+    kp0 = kp0.view(1, -1, 2).expand(b, -1, -1)  # (b, h0*w0, 2)
+    kp1 = kp1.view(1, -1, 2).expand(b, -1, -1)  # (b, h1*w1, 2)
+    
+    kp0_1 = warp_points_torch(kp0, H, inverse=False)  # (b, h0*w0, 2)
+    kp1_0 = warp_points_torch(kp1, H, inverse=True)  # (b, h1*w1, 2)
+
+    def get_patch_idx(coords, pw):
+        return ((coords[..., 1] // patch_size) * pw + (coords[..., 0] // patch_size)).long()
+
+    pidx0 = get_patch_idx(kp0, pw0)
+    pidx0_1 = get_patch_idx(kp0_1, pw1)
+    pidx1 = get_patch_idx(kp1, pw1)
+    pidx1_0 = get_patch_idx(kp1_0, pw0)
+
+    valid0 = (
+        (kp0_1[..., 0] > 0)
+        * (kp0_1[..., 0] < w1 - 1)
+        * (kp0_1[..., 1] > 0)
+        * (kp0_1[..., 1] < h1 - 1)
+    )
+    valid1 = (
+        (kp1_0[..., 0] > 0)
+        * (kp1_0[..., 0] < w0 - 1)
+        * (kp1_0[..., 1] > 0)
+        * (kp1_0[..., 1] < h0 - 1)
+    )
+    
+    b_idx0 = torch.arange(b, device=H.device).view(b, 1).expand_as(pidx0)  # (b, h0*w0)
+    b_idx1 = torch.arange(b, device=H.device).view(b, 1).expand_as(pidx1)  # (b, h1*w1)
+
+    m_count0 = torch.zeros(b, m, n, dtype=torch.int16, device=H.device)
+    m_count1 = m_count0.clone()
+    m_count0.index_put_((b_idx0[valid0], pidx0[valid0], pidx0_1[valid0]), m_count0.new_tensor(1), accumulate=True)
+    m_count1.index_put_((b_idx1[valid1], pidx1_0[valid1], pidx1[valid1]), m_count1.new_tensor(1), accumulate=True)
+    positive = (m_count0 >= pos_th) | (m_count1 >= pos_th)
+    negative = (m_count0 <= neg_th) & (m_count1 <= neg_th)
+
+    unmatched = m_count0.new_tensor(UNMATCHED_FEATURE)
+    ignore = m_count0.new_tensor(IGNORE_FEATURE)
+    m0 = torch.where(positive.any(-1), 1, ignore)
+    m1 = torch.where(positive.any(-2), 1, ignore)
+    m0 = torch.where(negative.any(-1), unmatched, m0)
+    m1 = torch.where(negative.any(-2), unmatched, m1)
+
+    return {
+        "assignment": positive,
+        "matches0": m0,
+        "matches1": m1,
     }
 
 

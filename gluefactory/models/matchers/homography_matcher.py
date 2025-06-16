@@ -1,6 +1,7 @@
 from ...geometry.gt_generation import (
     gt_line_matches_from_homography,
     gt_matches_from_homography,
+    gt_patch_matches_from_homography,
     gt_warp_from_homography,
 )
 from ..base_model import BaseModel
@@ -90,12 +91,12 @@ class HomographyMatcher(BaseModel):
                 result["patch_warps0_1_prob"] = warp_prob
         if self.conf.use_init_matching:
             if self.conf.use_points:
-                result["init"] = gt_matches_from_homography(
-                    data["init_keypoints0"],
-                    data["init_keypoints1"],
+                result["init"] = gt_patch_matches_from_homography(
+                    data,
                     data["H_0to1"],
-                    pos_th=self.conf.init_th_positive,
-                    neg_th=self.conf.init_th_negative,
+                    patch_size=16,  # TODO: patch size should be inferred from some data.
+                    # pos_th=self.conf.init_th_positive,
+                    # neg_th=self.conf.init_th_negative,
                 )
         return result
 
