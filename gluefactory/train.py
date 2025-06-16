@@ -235,7 +235,7 @@ def training(conf, output_dir, args):
             init_cp = None
 
     OmegaConf.set_struct(conf, True)  # prevent access to unknown entries
-    set_seed(conf.train.seed + global_rank)
+    set_seed(conf.train.seed)
     if global_rank == 0:
         writer = SummaryWriter(log_dir=str(output_dir))
         if os.getenv("WANDB_API_KEY") or os.path.exists(os.path.expanduser("~/.netrc")):
