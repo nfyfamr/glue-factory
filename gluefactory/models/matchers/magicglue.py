@@ -1180,14 +1180,14 @@ class MagicGlue(nn.Module):
         losses = {
             "total": nll_init + loss_refine + loss_light,
             "nll_init": nll_init,
-            "num_init_matches": pred["valid_mask0"][:, 0].sum(-1).float(),
+            # "num_init_matches": pred["valid_mask0"][:, 0].sum(-1).float(),
             "loss_refine": loss_refine,
             "reg_loss": reg_loss,
             "conf_loss": conf_loss,
             "loss_light": loss_light,
             "row_norm": row_norm,
             "last": loss_light_last_blk,
-            "peak_match": pred["init_assign"].sum(dim=(-2, -1)).max().float().expand(1),
+            "init_peak_match": pred["init_assign"].sum(dim=(-2, -1)).max().float().expand(1),
             **loss_metrics,
             **loss_metrics_init,
         }
