@@ -395,6 +395,8 @@ class LooseMatchAssignment(nn.Module):
         _, n, _ = mdesc1.shape
         mdesc0 = mdesc0.unsqueeze(2).expand(-1, m, n, -1)  # (b, m, n, d)
         mdesc1 = mdesc1.unsqueeze(1).expand(-1, m, n, -1)  # (b, m, n, d)
+        # TODO: To retain multi-matchability, linear module instead of einsum (dot product) is applied.
+        # Maybe einsum is similar accuracy, need to test it.
         feats = torch.cat([mdesc0, mdesc1], dim=-1).view(b * m * n, -1)  # (b*m*n, 2d)
         corres = self.correspondencies(feats).view(b, m, n)
         z0 = self.matchability(desc0)

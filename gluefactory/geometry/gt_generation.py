@@ -209,15 +209,16 @@ def gt_patch_matches_from_homography(data, H, patch_size=16, pos_th=3, neg_th=0,
     m_count1 = m_count0.clone()
     m_count0.index_put_((b_idx0[valid0], pidx0[valid0], pidx0_1[valid0]), m_count0.new_tensor(1), accumulate=True)
     m_count1.index_put_((b_idx1[valid1], pidx1_0[valid1], pidx1[valid1]), m_count1.new_tensor(1), accumulate=True)
-    positive = (m_count0 >= pos_th) | (m_count1 >= pos_th)
-    negative = (m_count0 <= neg_th) & (m_count1 <= neg_th)
+    positive = (m_count0 >= pos_th) | (m_count1 >= pos_th)  # patches overlap at least 'pos_th' pixels in the other patches.
+    negative = (m_count0 <= neg_th) & (m_count1 <= neg_th)  # patches do not overlap at least 'neg_th' pixels in the other patches.
 
     unmatched = m_count0.new_tensor(UNMATCHED_FEATURE)
     ignore = m_count0.new_tensor(IGNORE_FEATURE)
-    m0 = torch.where(positive.any(-1), 1, ignore)
-    m1 = torch.where(positive.any(-2), 1, ignore)
-    m0 = torch.where(negative.any(-1), unmatched, m0)
-    m1 = torch.where(negative.any(-2), unmatched, m1)
+    idx_placeholder = m_count0.new_tensor(1)
+    m0 = torch.where(negative.any(-1), unmatched, ignore)  # First, find unmatched, undecidable points
+    m1 = torch.where(negative.any(-2), unmatched, ignore)
+    m0 = torch.where(positive.any(-1), idx_placeholder, m0)  # Then, mark positive points
+    m1 = torch.where(positive.any(-2), idx_placeholder, m1)
 
     return {
         "assignment": positive,
