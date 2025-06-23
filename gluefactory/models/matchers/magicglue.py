@@ -1067,8 +1067,10 @@ class MagicGlue(nn.Module):
         zero = pred["init_log_assignment"].new_tensor([0])
         nll_init, loss_refine, loss_light = zero.clone(), zero.clone(), zero.clone()
         
-        nll_init, _, loss_metrics_init = self.loss_fn({"log_assignment": pred["init_log_assignment"]}, data["gt_init"])
-        loss_metrics_init = {f"{k}_init": v for k, v in loss_metrics_init.items()}
+        # nll_init, _, loss_metrics_init = self.loss_fn({"log_assignment": pred["init_log_assignment"]}, data["gt_init"])
+        # loss_metrics_init = {f"{k}_init": v for k, v in loss_metrics_init.items()}
+        nll_init2 = -(data["gt_init"]["gt_assignment"].float() * pred["init_log_assignment"][:, :-1, :-1] + (1 - data["gt_init"]["gt_assignment"].float()) * torch.log1p(-torch.exp(pred["init_log_assignment"][:, :-1, :-1]))).mean((-1, -2))
+        loss_metrics_init = {}
         
         # Regression loss
         def get_refine_loss(pred, data, i):
