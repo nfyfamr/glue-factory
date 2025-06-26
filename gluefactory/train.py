@@ -443,13 +443,12 @@ def training(conf, output_dir, args):
                 # make_dot(loss, params=dict(list(model.named_parameters()))).render("graph_torchviz", format="png")
                 # /home/ylee236/.conda/envs/glue-factory/lib/python3.10/site-packages/graphviz/backend/execute.py#78
                 # /home/ylee236/.conda/envs/glue-factory/bin/dot
-            if torch.isnan(loss).any():
-                if global_rank == 0:
-                    logger.warning(f"Detected NAN, skipping iteration {it}")
-                del pred, data, loss, losses
-                continue
+            
+            has_nan = torch.isnan(loss).any()
+            if has_nan:
+                logger.warning(f"Detected NAN on rank {global_rank}, skipping iteration {it}")
 
-            do_backward = loss.requires_grad
+            do_backward = loss.requires_grad and not has_nan
             if distributed:
                 do_backward = torch.tensor(do_backward).float().to(device)
                 torch.distributed.all_reduce(
@@ -498,7 +497,7 @@ def training(conf, output_dir, args):
                 for k in sorted(losses.keys()):
                     if distributed:
                         losses[k] = losses[k].sum(-1)
-                        torch.distributed.reduce(losses[k], dst=0)
+                        torch.distributed.reduce(losses[k], dst=0)  # A problem may occur here due to NaN loss.
                         losses[k] /= train_loader.batch_size * world_size
                     losses[k] = torch.mean(losses[k], -1)
                     losses[k] = losses[k].item()
