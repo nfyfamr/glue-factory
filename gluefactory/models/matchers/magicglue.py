@@ -384,13 +384,14 @@ class LooseMatchAssignment(nn.Module):
         super().__init__()
         self.dim = dim
         self.matchability = nn.Linear(in_dim, 1, bias=True)
-        self.final_proj = nn.Linear(in_dim, dim, bias=True)
+        self.final_proj0 = nn.Linear(in_dim, dim, bias=True)
+        self.final_proj1 = nn.Linear(in_dim, dim, bias=True)
         self.correspondencies = nn.Linear(2 * dim, 1, bias=True)
 
     def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
         """build assignment matrix from descriptors"""
         """This version generate multiple assignment for a keypoint"""
-        mdesc0, mdesc1 = self.final_proj(desc0), self.final_proj(desc1)
+        mdesc0, mdesc1 = self.final_proj0(desc0), self.final_proj1(desc1)
         b, m, d = mdesc0.shape
         _, n, _ = mdesc1.shape
         mdesc0 = mdesc0.unsqueeze(2).expand(-1, m, n, -1)  # (b, m, n, d)
@@ -1070,7 +1071,22 @@ class MagicGlue(nn.Module):
         # nll_init, _, loss_metrics_init = self.loss_fn({"log_assignment": pred["init_log_assignment"]}, data["gt_init"])
         # loss_metrics_init = {f"{k}_init": v for k, v in loss_metrics_init.items()}
         pos_w = torch.prod(torch.tensor(data["gt_init"]["gt_assignment"].shape[-2:])) / data["gt_init"]["gt_assignment"].float().sum((-1, -2)).view(-1, 1, 1)
-        nll_init = -(pos_w * data["gt_init"]["gt_assignment"].float() * pred["init_log_assignment"][:, :-1, :-1] + (1 - data["gt_init"]["gt_assignment"].float()) * torch.log1p(-torch.exp(pred["init_log_assignment"][:, :-1, :-1]))).mean((-1, -2))
+        nll_pos = -(pos_w * data["gt_init"]["gt_assignment"].float() * pred["init_log_assignment"][:, :-1, :-1] + (1 - data["gt_init"]["gt_assignment"].float()) * torch.log1p(-torch.exp(pred["init_log_assignment"][:, :-1, :-1]))).mean((-1, -2))
+        # Calculate negative labels
+        b, cd, ch0, cw0 = data["coarse_descriptors0"].shape
+        _, cd, ch1, cw1 = data["coarse_descriptors1"].shape
+        desc0 = data["coarse_descriptors0"].permute(0, 2, 3, 1).view(b, -1, cd).contiguous()  # (b, ch0*cw0, cd)
+        desc1 = data["coarse_descriptors1"].permute(0, 2, 3, 1).view(b, -1, cd).contiguous()  # (b, ch0*cw0, cd)
+        if torch.is_autocast_enabled():
+            desc0 = desc0.half()
+            desc1 = desc1.half()
+        true_z0 = data["gt_init"]["gt_assignment"].any(dim=2)
+        true_z1 = data["gt_init"]["gt_assignment"].any(dim=1)
+        z0, z1 = self.init_log_assignment.get_matchability(desc0), self.init_log_assignment.get_matchability(desc1)
+        num_neg0 = (~true_z0).sum(-1).clamp(min=1.0)
+        num_neg1 = (~true_z1).sum(-1).clamp(min=1.0)
+        nll_neg = -(((~true_z0) * torch.log1p(-z0)).sum(-1) / num_neg0 + ((~true_z1) * torch.log1p(-z1)).sum(-1) / num_neg1) / 2
+        nll_init = nll_init + nll_pos
         loss_metrics_init = {}
         
         # Regression loss
@@ -1181,7 +1197,7 @@ class MagicGlue(nn.Module):
                 loss_light = loss_light + confidence
 
         losses = {
-            "total": nll_init + loss_refine + loss_light,
+            "total": 10 * nll_init + loss_refine + loss_light,
             "nll_init": nll_init,
             # "num_init_matches": pred["valid_mask0"][:, 0].sum(-1).float(),
             "loss_refine": loss_refine,
